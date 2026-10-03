@@ -25,6 +25,7 @@ extension EditorEffects on EditorController {
   );
 
   Future<void> applyFilter(EditorFilter filter, {double? amount}) async {
+    if (!_busy && hasActiveTransform) cancelTransform();
     final layer = activeLayer;
     final selectedPath = selectionPath;
     if (_busy ||
@@ -134,6 +135,7 @@ extension EditorEffects on EditorController {
     void Function(Canvas) transform,
   ) async {
     if (_busy || _disposed || _stroke != null) return;
+    if (hasActiveTransform) cancelTransform();
     if (size.width < 1 ||
         size.height < 1 ||
         size.width > 4096 ||
@@ -175,6 +177,7 @@ extension EditorEffects on EditorController {
   }
 
   Future<void> cropToSelection() async {
+    if (!_busy && hasActiveTransform) cancelTransform();
     final rect = _selection?.intersect(Offset.zero & documentSize);
     if (rect == null || rect.isEmpty) return;
     final crop = Rect.fromLTRB(
@@ -211,6 +214,7 @@ extension EditorEffects on EditorController {
   }
 
   Future<void> flipActiveLayer({bool horizontal = true}) async {
+    if (!_busy && hasActiveTransform) cancelTransform();
     final layer = activeLayer;
     if (_busy ||
         layer == null ||
@@ -245,6 +249,7 @@ extension EditorEffects on EditorController {
   }
 
   Future<void> mergeDown() async {
+    if (!_busy && hasActiveTransform) cancelTransform();
     final index = _layers.indexWhere((layer) => layer.id == _activeLayerId);
     if (_busy || index < 1 || _disposed || _stroke != null) return;
     final top = _layers[index], bottom = _layers[index - 1];
@@ -282,6 +287,7 @@ extension EditorEffects on EditorController {
 
   Future<void> flattenDocument() async {
     if (_busy || _layers.isEmpty || _disposed || _stroke != null) return;
+    if (hasActiveTransform) cancelTransform();
     _busy = true;
     _notify();
     try {

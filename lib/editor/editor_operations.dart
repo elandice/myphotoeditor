@@ -29,6 +29,7 @@ extension EditorOperations on EditorController {
 
   void setSelectionPath(Path? path, {EditorSelectionKind? kind}) {
     if (_busy) return;
+    if (hasActiveTransform) cancelTransform();
     final bounds = Offset.zero & documentSize;
     final clipped = path == null
         ? null
@@ -52,16 +53,20 @@ extension EditorOperations on EditorController {
     kind: EditorSelectionKind.lasso,
   );
   void selectAll() => setSelection(Offset.zero & documentSize);
-  void invertSelection() => setSelectionPath(
-    _selectionPath == null
-        ? (Path()..addRect(Offset.zero & documentSize))
-        : Path.combine(
-            PathOperation.difference,
-            Path()..addRect(Offset.zero & documentSize),
-            _selectionPath!,
-          ),
-    kind: EditorSelectionKind.inverted,
-  );
+  void invertSelection() {
+    if (_busy) return;
+    if (hasActiveTransform) cancelTransform();
+    setSelectionPath(
+      _selectionPath == null
+          ? (Path()..addRect(Offset.zero & documentSize))
+          : Path.combine(
+              PathOperation.difference,
+              Path()..addRect(Offset.zero & documentSize),
+              _selectionPath!,
+            ),
+      kind: EditorSelectionKind.inverted,
+    );
+  }
 
   Float64List _inverseLayerMatrix(EditorLayer layer) {
     final center = documentSize.center(Offset.zero);
@@ -92,6 +97,7 @@ extension EditorOperations on EditorController {
       path.transform(_inverseLayerMatrix(layer));
 
   Future<void> _drawOnActive(String label, void Function(Canvas) draw) async {
+    if (!_busy && hasActiveTransform) cancelTransform();
     final layer = activeLayer;
     if (_busy ||
         _disposed ||
@@ -264,6 +270,7 @@ extension EditorOperations on EditorController {
 
   Future<void> magicWand(Offset point, {double tolerance = .12}) async {
     if (_busy || _disposed) return;
+    if (hasActiveTransform) cancelTransform();
     _busy = true;
     _notify();
     try {
@@ -283,6 +290,7 @@ extension EditorOperations on EditorController {
   }
 
   Future<void> floodFill(Offset point, {double tolerance = .12}) async {
+    if (!_busy && hasActiveTransform) cancelTransform();
     if (_busy || activeLayer == null || activeLayer!.locked || _disposed) {
       return;
     }
@@ -308,6 +316,7 @@ extension EditorOperations on EditorController {
   }
 
   Future<void> copySelection() async {
+    if (!_busy && hasActiveTransform) cancelTransform();
     final layer = activeLayer;
     if (_busy || layer == null || _disposed || _stroke != null) return;
     _busy = true;
@@ -338,6 +347,7 @@ extension EditorOperations on EditorController {
   }
 
   Future<void> pasteSelection() async {
+    if (!_busy && hasActiveTransform) cancelTransform();
     final clipboard = _clipboard;
     if (_busy || clipboard == null || _disposed) return;
     _busy = true;
@@ -363,6 +373,7 @@ extension EditorOperations on EditorController {
   }
 
   Future<void> createMaskFromSelection() async {
+    if (!_busy && hasActiveTransform) cancelTransform();
     final layer = activeLayer;
     if (_busy || layer == null || layer.locked || _selectionPath == null) {
       return;
@@ -414,6 +425,7 @@ extension EditorOperations on EditorController {
   }
 
   Future<void> invertActiveMask() async {
+    if (!_busy && hasActiveTransform) cancelTransform();
     final layer = activeLayer;
     if (_busy || layer == null || layer.mask == null || layer.locked) return;
     _busy = true;

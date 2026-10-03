@@ -365,4 +365,250 @@ void main() {
       await unmount(tester, editor, viewport);
     },
   );
+
+  testWidgets(
+    'transform moves only selected pixels and ignores drags outside their bounds',
+    (tester) async {
+      final editor = EditorController();
+      final viewport = ViewportController();
+      await tester.runAsync(() async {
+        await editor.newDocument(120, 90);
+        editor.setBrushColor(const Color(0xFFFF0000));
+        await editor.drawShape(
+          const Rect.fromLTWH(20, 20, 30, 30),
+          ellipse: false,
+        );
+        editor.setBrushColor(const Color(0xFF0000FF));
+        await editor.drawShape(
+          const Rect.fromLTWH(90, 5, 20, 20),
+          ellipse: false,
+        );
+      });
+      editor.setSelection(const Rect.fromLTWH(20, 20, 30, 30));
+      editor.setTool(EditorTool.transform);
+      final previousHistory = editor.historyLength;
+      await mount(tester, editor, viewport);
+      var gesture = await tester.startGesture(
+        viewport.documentToViewport(const Offset(5, 5)),
+        kind: PointerDeviceKind.mouse,
+      );
+      await gesture.moveTo(viewport.documentToViewport(const Offset(10, 15)));
+      await gesture.up();
+      expect(editor.historyLength, previousHistory);
+      expect(editor.selection, const Rect.fromLTWH(20, 20, 30, 30));
+      gesture = await tester.startGesture(
+        viewport.documentToViewport(const Offset(35, 35)),
+        kind: PointerDeviceKind.mouse,
+      );
+      await gesture.moveTo(viewport.documentToViewport(const Offset(80, 50)));
+      expect(editor.isTransformingSelection, isTrue);
+      expect(editor.historyLength, previousHistory);
+      await gesture.up();
+      await finishRaster(tester, editor);
+      expect(editor.historyLength, previousHistory + 1);
+      expect(editor.activeLayer!.offset, Offset.zero);
+      expect((await pixel(tester, editor, 30, 30)).a, 0);
+      expect((await pixel(tester, editor, 80, 50)).toARGB32(), 0xFFFF0000);
+      expect((await pixel(tester, editor, 100, 15)).toARGB32(), 0xFF0000FF);
+      expect(editor.selectionPath!.contains(const Offset(80, 50)), isTrue);
+      editor.undo();
+      expect((await pixel(tester, editor, 30, 30)).toARGB32(), 0xFFFF0000);
+      expect((await pixel(tester, editor, 80, 50)).a, 0);
+      await unmount(tester, editor, viewport);
+    },
+  );
+
+  testWidgets('selection corner handles scale around the selection center', (
+    tester,
+  ) async {
+    final editor = EditorController();
+    final viewport = ViewportController();
+    await tester.runAsync(() => editor.newDocument(120, 90));
+    editor.setSelection(const Rect.fromLTWH(40, 20, 40, 40));
+    editor.setTool(EditorTool.transform);
+    await mount(tester, editor, viewport);
+    final gesture = await tester.startGesture(
+      viewport.documentToViewport(const Offset(80, 60)),
+      kind: PointerDeviceKind.mouse,
+    );
+    await gesture.moveTo(viewport.documentToViewport(const Offset(90, 70)));
+    expect(editor.activeTransformScale, closeTo(1.5, .00001));
+    expect(editor.transformCenter, const Offset(60, 40));
+    expect(editor.transformBounds, const Rect.fromLTWH(40, 20, 40, 40));
+    expect(
+      (editor.transformPoint(const Offset(80, 60)) - const Offset(90, 70))
+          .distance,
+      lessThan(.00001),
+    );
+    await gesture.up();
+    await finishRaster(tester, editor);
+    expect(editor.selection!.left, closeTo(30, .00001));
+    expect(editor.selection!.top, closeTo(10, .00001));
+    expect(editor.selection!.width, closeTo(60, .00001));
+    expect(editor.activeLayer!.scale, 1);
+    await unmount(tester, editor, viewport);
+  });
+
+  testWidgets('selection rotation uses its own handle and center', (
+    tester,
+  ) async {
+    final editor = EditorController();
+    final viewport = ViewportController();
+    await tester.runAsync(() => editor.newDocument(120, 90));
+    editor.setSelection(const Rect.fromLTWH(40, 20, 40, 40));
+    editor.setTool(EditorTool.transform);
+    await mount(tester, editor, viewport);
+    final top = viewport.documentToViewport(const Offset(60, 20));
+    final center = viewport.documentToViewport(const Offset(60, 40));
+    final handle = top - const Offset(0, 34);
+    final radius = (handle - center).distance;
+    final destination = center + Offset(radius, 0);
+    final gesture = await tester.startGesture(
+      handle,
+      kind: PointerDeviceKind.mouse,
+    );
+    await gesture.moveTo(destination);
+    expect(editor.activeTransformRotation, closeTo(math.pi / 2, .00001));
+    expect(editor.activeLayer!.rotation, 0);
+    await gesture.up();
+    await finishRaster(tester, editor);
+    expect(editor.selectionPath!.contains(const Offset(60, 40)), isTrue);
+    expect(editor.historyLength, 1);
+    await unmount(tester, editor, viewport);
+  });
+
+  testWidgets(
+    'second finger cancels selection transform without undo history',
+    (tester) async {
+      final editor = EditorController();
+      final viewport = ViewportController();
+      await tester.runAsync(() async {
+        await editor.newDocument(120, 90);
+        editor.setBrushColor(const Color(0xFFFF0000));
+        await editor.drawShape(
+          const Rect.fromLTWH(40, 20, 40, 40),
+          ellipse: false,
+        );
+      });
+      const selected = Rect.fromLTWH(40, 20, 40, 40);
+      editor.setSelection(selected);
+      editor.setTool(EditorTool.transform);
+      final previousHistory = editor.historyLength;
+      await mount(tester, editor, viewport);
+      final first = await tester.startGesture(
+        viewport.documentToViewport(const Offset(60, 40)),
+        pointer: 1,
+        kind: PointerDeviceKind.touch,
+      );
+      await first.moveTo(viewport.documentToViewport(const Offset(80, 50)));
+      expect(editor.isTransformingSelection, isTrue);
+      final second = await tester.startGesture(
+        viewport.documentToViewport(const Offset(30, 70)),
+        pointer: 2,
+        kind: PointerDeviceKind.touch,
+      );
+      expect(editor.isTransformingSelection, isFalse);
+      expect(editor.selection, selected);
+      await second.up();
+      await first.moveBy(const Offset(30, 20));
+      await first.up();
+      await finishRaster(tester, editor);
+      expect(editor.historyLength, previousHistory);
+      expect((await pixel(tester, editor, 60, 40)).toARGB32(), 0xFFFF0000);
+      expect((await pixel(tester, editor, 90, 50)).a, 0);
+      await unmount(tester, editor, viewport);
+    },
+  );
+
+  testWidgets('Escape cancels a transform and keeps the original selection', (
+    tester,
+  ) async {
+    final editor = EditorController();
+    final viewport = ViewportController();
+    await tester.runAsync(() => editor.newDocument(120, 90));
+    const selected = Rect.fromLTWH(40, 20, 40, 40);
+    editor.setSelection(selected);
+    editor.setTool(EditorTool.transform);
+    await mount(tester, editor, viewport);
+    final gesture = await tester.startGesture(
+      viewport.documentToViewport(const Offset(60, 40)),
+      kind: PointerDeviceKind.mouse,
+    );
+    await gesture.moveTo(viewport.documentToViewport(const Offset(80, 50)));
+    await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+    await gesture.up();
+    expect(editor.hasActiveTransform, isFalse);
+    expect(editor.selection, selected);
+    expect(editor.historyLength, 0);
+    await unmount(tester, editor, viewport);
+  });
+
+  testWidgets('changing tools during a transform cannot restart the old drag', (
+    tester,
+  ) async {
+    final editor = EditorController();
+    final viewport = ViewportController();
+    await tester.runAsync(() => editor.newDocument(120, 90));
+    const selected = Rect.fromLTWH(40, 20, 40, 40);
+    editor.setSelection(selected);
+    editor.setTool(EditorTool.transform);
+    await mount(tester, editor, viewport);
+    final gesture = await tester.startGesture(
+      viewport.documentToViewport(const Offset(60, 40)),
+      kind: PointerDeviceKind.mouse,
+    );
+    await gesture.moveTo(viewport.documentToViewport(const Offset(80, 50)));
+    editor.setTool(EditorTool.brush);
+    expect(editor.hasActiveTransform, isFalse);
+    await gesture.moveTo(viewport.documentToViewport(const Offset(90, 60)));
+    await gesture.up();
+    expect(editor.hasActiveTransform, isFalse);
+    expect(editor.selection, selected);
+    expect(editor.historyLength, 0);
+    await unmount(tester, editor, viewport);
+  });
+
+  for (final kind in [PointerDeviceKind.mouse, PointerDeviceKind.touch]) {
+    testWidgets('tiny selection center moves with ${kind.name}', (
+      tester,
+    ) async {
+      final editor = EditorController();
+      final viewport = ViewportController();
+      await tester.runAsync(() => editor.newDocument(120, 90));
+      editor.setTool(EditorTool.transform);
+      await mount(tester, editor, viewport);
+      const center = Offset(60, 45);
+      final screenSize = kind == PointerDeviceKind.mouse
+          ? const Size(16, 8)
+          : const Size(50, 20);
+      final selected = Rect.fromCenter(
+        center: center,
+        width: screenSize.width / viewport.zoom,
+        height: screenSize.height / viewport.zoom,
+      );
+      editor.setSelection(selected);
+      await tester.pump();
+      const delta = Offset(8, 6);
+      final gesture = await tester.startGesture(
+        viewport.documentToViewport(center),
+        kind: kind,
+      );
+      await gesture.moveTo(viewport.documentToViewport(center + delta));
+      expect(editor.activeTransformScale, 1);
+      expect(editor.activeTransformRotation, 0);
+      expect((editor.activeTransformOffset - delta).distance, lessThan(.00001));
+      await gesture.up();
+      await finishRaster(tester, editor);
+      expect(editor.historyLength, 1);
+      expect(
+        (editor.selection!.center - center - delta).distance,
+        lessThan(.00001),
+      );
+      expect(editor.selection!.width, closeTo(selected.width, .00001));
+      expect(editor.selection!.height, closeTo(selected.height, .00001));
+      editor.undo();
+      expect(editor.selection, selected);
+      await unmount(tester, editor, viewport);
+    });
+  }
 }

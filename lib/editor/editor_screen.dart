@@ -36,6 +36,21 @@ class _EditorScreenState extends State<EditorScreen> {
   bool _grid = false;
   String _documentName = '고요한 풍경';
   int _inspectorTab = 0;
+  bool _transformSliderActive = false;
+
+  bool get _hasTransformSelection =>
+      _editor.isTransformingSelection ||
+      (_editor.selection != null && !_editor.selection!.isEmpty);
+
+  String _displayToolName(EditorTool tool) =>
+      tool == EditorTool.transform && _hasTransformSelection
+      ? '선택 영역 변형'
+      : _toolName(tool);
+
+  String _displayToolHint(EditorTool tool) =>
+      tool == EditorTool.transform && _hasTransformSelection
+      ? '선택 영역을 드래그하여 이동 · 모서리로 크기 조절 · 위쪽 손잡이로 회전'
+      : _toolHint(tool);
   void _updateUI(VoidCallback update) {
     if (mounted) setState(update);
   }
@@ -411,7 +426,12 @@ class _EditorScreenState extends State<EditorScreen> {
       return KeyEventResult.handled;
     }
     if (key == LogicalKeyboardKey.escape) {
-      _editor.clearSelection();
+      if (_editor.hasActiveTransform) {
+        _transformSliderActive = false;
+        _editor.cancelTransform();
+      } else {
+        _editor.clearSelection();
+      }
       return KeyEventResult.handled;
     }
     if (key == LogicalKeyboardKey.delete ||
@@ -660,7 +680,7 @@ class _EditorScreenState extends State<EditorScreen> {
           Icon(_toolIcon(_editor.tool), size: 18, color: _accent),
           const SizedBox(width: 10),
           Text(
-            _toolName(_editor.tool),
+            _displayToolName(_editor.tool),
             style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
           ),
           const SizedBox(width: 24),
@@ -704,7 +724,7 @@ class _EditorScreenState extends State<EditorScreen> {
             ],
           ] else ...[
             Text(
-              _toolHint(_editor.tool),
+              _displayToolHint(_editor.tool),
               style: const TextStyle(fontSize: 12, color: _muted),
             ),
             ..._extraToolOptions(),
@@ -777,7 +797,7 @@ class _EditorScreenState extends State<EditorScreen> {
   Widget _toolButton(EditorTool tool, {bool label = false}) {
     final selected = _editor.tool == tool;
     return Tooltip(
-      message: '${_toolName(tool)} (${_toolKey(tool)})',
+      message: '${_displayToolName(tool)} (${_toolKey(tool)})',
       child: Material(
         color: selected ? const Color(0xFFEDE9FC) : Colors.transparent,
         borderRadius: BorderRadius.circular(12),
@@ -798,7 +818,7 @@ class _EditorScreenState extends State<EditorScreen> {
                 if (label) ...[
                   const SizedBox(height: 4),
                   Text(
-                    _toolName(tool),
+                    _displayToolName(tool),
                     style: TextStyle(
                       fontSize: 9,
                       color: selected ? _accent : _muted,
@@ -1105,6 +1125,9 @@ class _EditorScreenState extends State<EditorScreen> {
 
   Widget _layersPanel() {
     final layer = _editor.activeLayer;
+    final transformRotation = _editor.activeTransformRotation;
+    final transformScale = _editor.activeTransformScale;
+    final transformOffset = _editor.activeTransformOffset;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -1208,42 +1231,60 @@ class _EditorScreenState extends State<EditorScreen> {
         const SizedBox(height: 20),
         const Divider(),
         const SizedBox(height: 16),
-        _sectionHeading('레이어 변형', Icons.open_with_rounded),
+        _sectionHeading(
+          _hasTransformSelection ? '선택 영역 변형' : '레이어 변형',
+          Icons.open_with_rounded,
+        ),
+        if (_hasTransformSelection) ...[
+          const SizedBox(height: 10),
+          const Text(
+            '선택한 픽셀만 이동·회전·확대합니다.\n슬라이더를 놓으면 현재 변형을 적용합니다.',
+            style: TextStyle(fontSize: 11, color: _muted, height: 1.6),
+          ),
+        ],
         const SizedBox(height: 20),
         if (layer != null) ...[
           _propertySlider(
             '회전',
-            layer.rotation * 180 / math.pi,
+            transformRotation * 180 / math.pi,
             -180,
             180,
-            '${(layer.rotation * 180 / math.pi).round()}°',
+            '${(transformRotation * 180 / math.pi).round()}°',
             (value) =>
-                _editor.setLayerTransform(rotation: value * math.pi / 180),
+                _editor.setActiveTransform(rotation: value * math.pi / 180),
+            transform: true,
           ),
           const SizedBox(height: 16),
           _propertySlider(
             '크기',
-            layer.scale,
+            transformScale,
             .1,
             4,
-            '${(layer.scale * 100).round()}%',
-            (value) => _editor.setLayerTransform(scale: value),
+            '${(transformScale * 100).round()}%',
+            (value) => _editor.setActiveTransform(scale: value),
+            transform: true,
           ),
           const SizedBox(height: 8),
           Row(
             children: [
               Text(
-                'X ${layer.offset.dx.round()}   Y ${layer.offset.dy.round()}',
+                'X ${transformOffset.dx.round()}   Y ${transformOffset.dy.round()}',
                 style: const TextStyle(fontSize: 11, color: _muted),
               ),
               const Spacer(),
               TextButton(
-                onPressed: () => _editor.setLayerTransform(
-                  offset: Offset.zero,
-                  rotation: 0,
-                  scale: 1,
+                onPressed: _hasTransformSelection
+                    ? (_editor.hasActiveTransform
+                          ? () {
+                              _transformSliderActive = false;
+                              _editor.cancelTransform();
+                            }
+                          : null)
+                    : _resetLayerTransform,
+                child: Text(
+                  _hasTransformSelection ? '변형 취소' : '초기화',
+                  style: const TextStyle(fontSize: 11),
                 ),
-                child: const Text('초기화', style: TextStyle(fontSize: 11)),
               ),
             ],
           ),
@@ -1421,7 +1462,7 @@ class _EditorScreenState extends State<EditorScreen> {
         const SizedBox(height: 12),
         Text(
           _editor.selection == null
-              ? '사각형 선택 도구로 편집 범위를 지정하세요. 브러시와 지우개는 선택 영역 안에만 적용됩니다.'
+              ? '선택 도구로 편집 범위를 지정하세요. 브러시·지우개·변형은 선택 영역에 적용됩니다.'
               : '${_editor.selection!.width.round()} × ${_editor.selection!.height.round()} px 선택됨',
           style: const TextStyle(fontSize: 12, color: _muted, height: 1.7),
         ),
@@ -1446,8 +1487,9 @@ class _EditorScreenState extends State<EditorScreen> {
     double min,
     double max,
     String display,
-    ValueChanged<double> onChanged,
-  ) => Column(
+    ValueChanged<double> onChanged, {
+    bool transform = false,
+  }) => Column(
     children: [
       Row(
         children: [
@@ -1461,17 +1503,60 @@ class _EditorScreenState extends State<EditorScreen> {
       ),
       SizedBox(
         height: 30,
-        child: Slider(
-          value: value.clamp(min, max),
-          min: min,
-          max: max,
-          onChangeStart: (_) => _editor.beginTransaction(label),
-          onChanged: onChanged,
-          onChangeEnd: (_) => _editor.commitTransaction(),
+        child: Listener(
+          onPointerCancel: transform ? (_) => _cancelTransformSlider() : null,
+          child: Slider(
+            value: value.clamp(min, max),
+            min: min,
+            max: max,
+            onChangeStart: (_) {
+              if (transform) {
+                _transformSliderActive = _editor.beginTransform();
+              } else {
+                _editor.beginTransaction(label);
+              }
+            },
+            onChanged:
+                transform &&
+                    (_editor.isBusy ||
+                        _editor.activeLayer == null ||
+                        _editor.activeLayer!.locked ||
+                        !_editor.activeLayer!.visible)
+                ? null
+                : (value) {
+                    if (!transform ||
+                        (_transformSliderActive &&
+                            _editor.hasActiveTransform)) {
+                      onChanged(value);
+                    }
+                  },
+            onChangeEnd: (_) {
+              if (transform) {
+                if (!_transformSliderActive) return;
+                _transformSliderActive = false;
+                _perform(_editor.commitTransform);
+              } else {
+                _editor.commitTransaction();
+              }
+            },
+          ),
         ),
       ),
     ],
   );
+
+  void _cancelTransformSlider() {
+    if (!_transformSliderActive) return;
+    _transformSliderActive = false;
+    _editor.cancelTransform();
+  }
+
+  void _resetLayerTransform() {
+    if (!_editor.beginTransform()) return;
+    _editor.setActiveTransform(offset: Offset.zero, rotation: 0, scale: 1);
+    _perform(_editor.commitTransform);
+  }
+
   Widget _sectionHeading(String text, IconData icon) => Row(
     children: [
       Icon(icon, size: 16, color: _muted),
@@ -1563,7 +1648,7 @@ class _EditorScreenState extends State<EditorScreen> {
         width: 420,
         child: SingleChildScrollView(
           child: Text(
-            'PC\nB 브러시 · E 지우개 · H 이동 · M 선택\nV 레이어 변형 · T 텍스트\nL 올가미 · W 자동 선택 · I 스포이드\nG 그라디언트 · S 복제 도장 · U 도형\n마우스 휠: 포인터 중심 확대/축소\nSpace + 드래그 / 가운데 버튼: 캔버스 이동\n[ / ]: 브러시 크기\nCtrl/⌘ Z: 실행 취소\nCtrl/⌘ Shift Z: 다시 실행\nCtrl/⌘ O: 사진 불러오기\nCtrl/⌘ S: 프로젝트 저장\nCtrl/⌘ 0: 화면에 맞춤\nEscape / Ctrl/⌘ D: 선택 해제\n\n모바일\n한 손가락으로 현재 도구 사용\n두 손가락으로 화면 이동·확대/축소\n하단 레이어·조정 버튼으로 상세 편집\n도구 모음에서 선택·리터칭·도형 도구 사용\n복제 도장: 원본 지정 버튼을 누른 뒤 캔버스 터치\n\n변형 도구에서 레이어를 드래그해 이동하고, 모서리와 회전 손잡이로 크기·각도를 바꿀 수 있습니다.\n\n사진은 새 레이어로 추가됩니다. PNG는 보이는 레이어를 합친 이미지로 저장되며, 레이어·텍스트·마스크는 .luma 프로젝트로 저장하고 다시 열 수 있습니다. 편집 기록은 현재 세션에서 유지됩니다.',
+            'PC\nB 브러시 · E 지우개 · H 이동 · M 선택\nV 선택 영역/레이어 변형 · T 텍스트\nL 올가미 · W 자동 선택 · I 스포이드\nG 그라디언트 · S 복제 도장 · U 도형\n마우스 휠: 포인터 중심 확대/축소\nSpace + 드래그 / 가운데 버튼: 캔버스 이동\n[ / ]: 브러시 크기\nCtrl/⌘ Z: 실행 취소\nCtrl/⌘ Shift Z: 다시 실행\nCtrl/⌘ O: 사진 불러오기\nCtrl/⌘ S: 프로젝트 저장\nCtrl/⌘ 0: 화면에 맞춤\nEscape / Ctrl/⌘ D: 선택 해제\n\n모바일\n한 손가락으로 현재 도구 사용\n두 손가락으로 화면 이동·확대/축소\n하단 레이어·조정 버튼으로 상세 편집\n도구 모음에서 선택·리터칭·도형 도구 사용\n복제 도장: 원본 지정 버튼을 누른 뒤 캔버스 터치\n\n영역을 선택한 뒤 변형 도구를 사용하면 현재 레이어의 선택한 픽셀만 이동·회전·확대합니다. 선택 상자를 드래그해 이동하고, 모서리와 위쪽 회전 손잡이로 크기·각도를 바꾸세요. 선택하지 않으면 레이어 전체를 변형합니다. 마우스나 손가락을 놓으면 한 번에 적용되고, Escape 또는 두 번째 손가락 터치로 진행 중 변형을 취소합니다.\n\n사진은 새 레이어로 추가됩니다. PNG는 보이는 레이어를 합친 이미지로 저장되며, 레이어·텍스트·마스크는 .luma 프로젝트로 저장하고 다시 열 수 있습니다. 편집 기록은 현재 세션에서 유지됩니다.',
             style: TextStyle(fontSize: 13, height: 1.8),
           ),
         ),

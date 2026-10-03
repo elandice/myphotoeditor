@@ -92,6 +92,55 @@ void main() {
   setUp(() => WidgetController.hitTestWarningShouldBeFatal = true);
   tearDown(() => WidgetController.hitTestWarningShouldBeFatal = false);
 
+  for (final viewportSize in [const Size(320, 700), const Size(1440, 900)]) {
+    testWidgets('selection transform slider works at $viewportSize', (
+      tester,
+    ) async {
+      final editor = await openEditor(tester, viewportSize);
+      const selection = Rect.fromLTWH(8, 12, 8, 8);
+      await tester.runAsync(() async {
+        await editor.newDocument(32, 32);
+        editor.setSelection(selection);
+        await editor.fillSelection(color: const Color(0xFFFF0000));
+        editor.setSelection(const Rect.fromLTWH(24, 24, 6, 6));
+        await editor.fillSelection(color: const Color(0xFF0000FF));
+      });
+      editor.setSelection(selection);
+      editor.setTool(EditorTool.transform);
+      await tester.pump();
+      if (viewportSize.width < 1000) {
+        await tester.tap(find.text('레이어 ${editor.layers.length}'));
+        await _routes(tester);
+      }
+      expect(find.text('선택 영역 변형'), findsWidgets);
+      final rotationSlider = find.byType(Slider).at(1);
+      await tester.ensureVisible(rotationSlider);
+      await tester.pump();
+      final history = editor.historyLength;
+      final originalImage = editor.activeLayer!.image;
+      final gesture = await tester.startGesture(
+        tester.getCenter(rotationSlider),
+      );
+      await gesture.moveBy(const Offset(25, 0));
+      await tester.pump();
+      expect(editor.isTransformingSelection, isTrue);
+      expect(editor.activeTransformRotation, greaterThan(0));
+      expect(identical(editor.activeLayer!.image, originalImage), isTrue);
+      await gesture.up();
+      await _work(tester, editor);
+      expect(editor.isTransformingSelection, isFalse);
+      expect(editor.activeLayer!.rotation, 0);
+      expect(editor.historyLength, history + 1);
+      expect(await _pixel(tester, editor, 12, 16), [255, 0, 0, 255]);
+      expect(await _pixel(tester, editor, 26, 26), [0, 0, 255, 255]);
+      editor.undo();
+      expect(editor.selection, selection);
+      expect(identical(editor.activeLayer!.image, originalImage), isTrue);
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox.shrink());
+    });
+  }
+
   testWidgets('all fifteen tools are reachable in the narrow mobile picker', (
     tester,
   ) async {

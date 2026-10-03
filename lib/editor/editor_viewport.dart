@@ -366,33 +366,49 @@ class _EditorViewportState extends State<EditorViewport>
   void _beginTransform(PointerDownEvent event) {
     final layer = editor.activeLayer;
     if (layer == null || layer.locked || !layer.visible) return;
-    _startLayerOffset = layer.offset;
-    _startRotation = layer.rotation;
-    _startScale = layer.scale;
-    _transformCenter = editor.documentSize.center(Offset.zero) + layer.offset;
     final shape = _transformShape(editor, viewport);
     final radius = event.kind == PointerDeviceKind.touch ? 28.0 : 17.0;
+    final polygon = shape == null
+        ? null
+        : (Path()..addPolygon(shape.corners, true));
+    // Small selections need a move target even when corner hit areas overlap.
+    // Reserve the interior nearest the center; exact and outside corners retain
+    // their larger mouse/touch resize targets.
+    final preferMove =
+        editor.selection != null &&
+        shape != null &&
+        polygon!.contains(event.localPosition) &&
+        (event.localPosition - (shape.corners[0] + shape.corners[2]) / 2)
+                .distance <
+            shape.corners
+                .map((point) => (point - event.localPosition).distance)
+                .reduce(math.min);
     if (shape != null &&
         (shape.rotationHandle - event.localPosition).distance <= radius) {
       _interaction = _Interaction.rotate;
-    } else if (shape != null &&
+    } else if (!preferMove &&
+        shape != null &&
         shape.corners.any(
           (point) => (point - event.localPosition).distance <= radius,
         )) {
       _interaction = _Interaction.scale;
     } else {
-      if (shape == null ||
-          !(Path()..addPolygon(shape.corners, true)).contains(
-            event.localPosition,
-          )) {
+      if (polygon == null || !polygon.contains(event.localPosition)) {
         return;
       }
       _interaction = _Interaction.move;
     }
+    _startLayerOffset = editor.activeTransformOffset;
+    _startRotation = editor.activeTransformRotation;
+    _startScale = editor.activeTransformScale;
+    _transformCenter = editor.transformCenter;
+    if (!editor.beginTransform()) {
+      _interaction = _Interaction.none;
+      return;
+    }
     final relative = _startDocument - _transformCenter;
     _startAngle = math.atan2(relative.dy, relative.dx);
     _startDistance = math.max(1, relative.distance);
-    editor.beginTransaction('레이어 변형');
   }
 
   void _initializePinch() {
@@ -423,6 +439,13 @@ class _EditorViewportState extends State<EditorViewport>
       return;
     }
     if (event.pointer != _primaryPointer) return;
+    if ((_interaction == _Interaction.move ||
+            _interaction == _Interaction.scale ||
+            _interaction == _Interaction.rotate) &&
+        !editor.hasActiveTransform) {
+      _cancelInteraction();
+      return;
+    }
     final point = viewport.viewportToDocument(event.localPosition);
     switch (_interaction) {
       case _Interaction.paint:
@@ -449,7 +472,7 @@ class _EditorViewportState extends State<EditorViewport>
       case _Interaction.shape:
         _updatePreview(point);
       case _Interaction.move:
-        editor.setLayerTransform(
+        editor.setActiveTransform(
           offset: _startLayerOffset + point - _startDocument,
         );
       case _Interaction.scale:
@@ -457,7 +480,7 @@ class _EditorViewportState extends State<EditorViewport>
             (_startScale * (point - _transformCenter).distance / _startDistance)
                 .clamp(.05, 10.0)
                 .toDouble();
-        editor.setLayerTransform(scale: scale);
+        editor.setActiveTransform(scale: scale);
       case _Interaction.rotate:
         final relative = point - _transformCenter;
         var angle =
@@ -465,7 +488,7 @@ class _EditorViewportState extends State<EditorViewport>
         if (HardwareKeyboard.instance.isShiftPressed) {
           angle = (angle / (math.pi / 12)).round() * (math.pi / 12);
         }
-        editor.setLayerTransform(rotation: angle);
+        editor.setActiveTransform(rotation: angle);
       case _Interaction.none:
       case _Interaction.text:
       case _Interaction.clickTool:
@@ -544,7 +567,7 @@ class _EditorViewportState extends State<EditorViewport>
       case _Interaction.move:
       case _Interaction.scale:
       case _Interaction.rotate:
-        editor.commitTransaction();
+        unawaited(_runTool(editor.commitTransform));
       case _Interaction.text:
         if ((event.localPosition - _startPoint).distance < 10) {
           unawaited(_editText(_startDocument));
@@ -615,7 +638,7 @@ class _EditorViewportState extends State<EditorViewport>
       case _Interaction.move:
       case _Interaction.scale:
       case _Interaction.rotate:
-        editor.cancelTransaction();
+        editor.cancelTransform();
       default:
         break;
     }
@@ -715,8 +738,12 @@ class _EditorViewportState extends State<EditorViewport>
               }
               if (event is KeyDownEvent &&
                   event.logicalKey == LogicalKeyboardKey.escape) {
+                final wasTransforming =
+                    _interaction == _Interaction.move ||
+                    _interaction == _Interaction.scale ||
+                    _interaction == _Interaction.rotate;
                 _cancelInteraction();
-                editor.clearSelection();
+                if (!wasTransforming) editor.clearSelection();
                 return KeyEventResult.handled;
               }
               return KeyEventResult.ignored;
@@ -788,13 +815,13 @@ _TransformShape? _transformShape(
 ) {
   final layer = editor.activeLayer;
   if (layer == null || !layer.visible) return null;
-  final rect = Offset.zero & editor.documentSize;
+  final rect = editor.transformBounds;
+  if (rect.isEmpty) return null;
   final corners =
       [rect.topLeft, rect.topRight, rect.bottomRight, rect.bottomLeft]
           .map(
-            (point) => viewport.documentToViewport(
-              editor.layerToDocument(point, layer),
-            ),
+            (point) =>
+                viewport.documentToViewport(editor.transformPoint(point)),
           )
           .toList();
   final top = (corners[0] + corners[1]) / 2;

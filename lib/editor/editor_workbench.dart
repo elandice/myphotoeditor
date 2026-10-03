@@ -38,7 +38,7 @@ extension _WorkbenchUI on _EditorScreenState {
             Icon(_toolIcon(tool), size: 24, color: _accent),
             const SizedBox(height: 8),
             Text(
-              _toolName(tool),
+              _displayToolName(tool),
               textAlign: TextAlign.center,
               style: const TextStyle(fontSize: 11),
             ),

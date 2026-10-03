@@ -16,6 +16,7 @@ export 'editor_models.dart';
 part 'editor_operations.dart';
 part 'editor_effects.dart';
 part 'editor_project.dart';
+part 'editor_transform.dart';
 
 /// Copy-on-write raster editor. Each committed stroke replaces one offscreen
 /// image; all unchanged layer images are shared across undo snapshots.
@@ -54,6 +55,7 @@ class EditorController extends ChangeNotifier {
   String _transactionLabel = '';
   bool _transactionChanged = false;
   _Stroke? _stroke;
+  _TransformSession? _transform;
   Timer? _gpuTimer;
   ui.Image? _gpuImage;
   int _gpuRevision = -1;
@@ -125,6 +127,7 @@ class EditorController extends ChangeNotifier {
   }
 
   void commitTransaction() {
+    if (_transform != null) return;
     if (_transaction == null) return;
     if (_transactionChanged) {
       _undo.add(_HistoryEntry(_transaction!, _transactionLabel));
@@ -138,6 +141,7 @@ class EditorController extends ChangeNotifier {
 
   void cancelTransaction() {
     final before = _transaction;
+    _transform = null;
     _transaction = null;
     _transactionChanged = false;
     if (before != null) _restore(before);
@@ -145,6 +149,7 @@ class EditorController extends ChangeNotifier {
   }
 
   void _edit(String label, VoidCallback action) {
+    if (_transform != null) cancelTransform();
     final ownsTransaction = _transaction == null;
     if (ownsTransaction) beginTransaction(label);
     action();
@@ -160,7 +165,7 @@ class EditorController extends ChangeNotifier {
     _gpuImage = null;
     _gpuRevision = -1;
     _gpuTimer?.cancel();
-    if (!_disposed && supportsWebGl && _stroke == null) {
+    if (!_disposed && supportsWebGl && _stroke == null && _transform == null) {
       _gpuTimer = Timer(const Duration(milliseconds: 110), _refreshGpu);
     }
     _notify();
@@ -180,6 +185,11 @@ class EditorController extends ChangeNotifier {
 
   void undo() {
     if (_busy || _stroke != null) return;
+    if (_transform != null) {
+      final changed = _transactionChanged;
+      cancelTransform();
+      if (changed) return;
+    }
     commitTransaction();
     if (_undo.isEmpty) return;
     final entry = _undo.removeLast();
@@ -190,6 +200,7 @@ class EditorController extends ChangeNotifier {
 
   void redo() {
     if (_busy || _stroke != null) return;
+    if (_transform != null) cancelTransform();
     commitTransaction();
     if (_redo.isEmpty) return;
     final entry = _redo.removeLast();
@@ -264,6 +275,7 @@ class EditorController extends ChangeNotifier {
       throw ArgumentError('문서 크기는 1~4096 픽셀이어야 합니다.');
     }
     cancelStroke();
+    cancelTransform();
     _busy = true;
     _notify();
     try {
@@ -296,6 +308,7 @@ class EditorController extends ChangeNotifier {
 
   Future<void> addLayer({String? name}) async {
     if (_busy) return;
+    cancelTransform();
     _busy = true;
     _notify();
     try {
@@ -325,11 +338,13 @@ class EditorController extends ChangeNotifier {
     if (_busy || _stroke != null || !_layers.any((layer) => layer.id == id)) {
       return;
     }
+    if (id != _activeLayerId) cancelTransform();
     _activeLayerId = id;
     _notify();
   }
 
   void removeActiveLayer() {
+    if (!_busy) cancelTransform();
     final index = _layers.indexWhere((layer) => layer.id == _activeLayerId);
     if (_busy || index < 0 || _layers[index].locked) return;
     _edit('레이어 삭제', () {
@@ -341,6 +356,7 @@ class EditorController extends ChangeNotifier {
   }
 
   void duplicateActiveLayer() {
+    if (!_busy) cancelTransform();
     final layer = activeLayer;
     if (_busy || layer == null) return;
     final duplicate = layer.copyWith(id: _id(), name: '${layer.name} 복사');
@@ -351,6 +367,7 @@ class EditorController extends ChangeNotifier {
   }
 
   void moveLayer(String id, int delta) {
+    if (!_busy) cancelTransform();
     final index = _layers.indexWhere((layer) => layer.id == id);
     if (_busy || index < 0 || _layers[index].locked) return;
     final target = (index + delta).clamp(0, _layers.length - 1);
@@ -367,6 +384,7 @@ class EditorController extends ChangeNotifier {
     String label, {
     bool allowLocked = false,
   }) {
+    if (!_busy) cancelTransform();
     final index = _layers.indexWhere((layer) => layer.id == id);
     if (_busy || index < 0 || (!allowLocked && _layers[index].locked)) return;
     _edit(label, () {
@@ -434,6 +452,7 @@ class EditorController extends ChangeNotifier {
   }
 
   void setTool(EditorTool value) {
+    if (value != _tool) cancelTransform();
     if (_stroke != null) cancelStroke();
     _tool = value;
     _notify();
@@ -456,6 +475,7 @@ class EditorController extends ChangeNotifier {
 
   void setSelection(Rect? value) {
     if (_busy) return;
+    cancelTransform();
     final bounds = Offset.zero & _documentSize;
     final selected = value?.intersect(bounds);
     _selection = selected == null || selected.isEmpty ? null : selected;
@@ -509,6 +529,7 @@ class EditorController extends ChangeNotifier {
   }
 
   void beginStroke(Offset point, {double pressure = 1}) {
+    if (!_busy) cancelTransform();
     final layer = activeLayer;
     if (_busy ||
         layer == null ||
@@ -669,6 +690,7 @@ class EditorController extends ChangeNotifier {
     canvas.clipRect(Offset.zero & _documentSize);
     if (_gpuImage != null &&
         _gpuRevision == _revision &&
+        _transform == null &&
         (!includeStroke || _stroke == null)) {
       canvas.drawImage(_gpuImage!, Offset.zero, Paint());
     } else {
@@ -702,12 +724,20 @@ class EditorController extends ChangeNotifier {
           ),
         ),
     );
-    final center = _documentSize.center(Offset.zero);
-    canvas.translate(center.dx + layer.offset.dx, center.dy + layer.offset.dy);
-    canvas.rotate(layer.rotation);
-    canvas.scale(layer.scale);
-    canvas.translate(-center.dx, -center.dy);
-    paintLayerContent(canvas, layer, includeStroke: includeStroke);
+    final transform = _transform;
+    if (transform?.path != null && transform!.layer.id == layer.id) {
+      _paintSelectionTransform(canvas, transform);
+    } else {
+      final center = _documentSize.center(Offset.zero);
+      canvas.translate(
+        center.dx + layer.offset.dx,
+        center.dy + layer.offset.dy,
+      );
+      canvas.rotate(layer.rotation);
+      canvas.scale(layer.scale);
+      canvas.translate(-center.dx, -center.dy);
+      paintLayerContent(canvas, layer, includeStroke: includeStroke);
+    }
     canvas.restore();
   }
 
@@ -769,6 +799,7 @@ class EditorController extends ChangeNotifier {
 
   Future<void> importImage(Uint8List bytes, String name) async {
     if (_busy) return;
+    cancelTransform();
     _busy = true;
     _notify();
     ui.Codec? codec;
@@ -871,6 +902,7 @@ class EditorController extends ChangeNotifier {
     String? fontFamily,
   }) async {
     if (_busy || text.trim().isEmpty) return;
+    cancelTransform();
     _busy = true;
     _notify();
     try {
@@ -911,6 +943,7 @@ class EditorController extends ChangeNotifier {
     Color? color,
     String? fontFamily,
   }) async {
+    if (!_busy) cancelTransform();
     final layer = activeLayer;
     if (_busy ||
         layer == null ||
@@ -1014,7 +1047,13 @@ class EditorController extends ChangeNotifier {
   }
 
   Future<void> _refreshGpu() async {
-    if (_disposed || _stroke != null || _busy || _gpuBuilding) return;
+    if (_disposed ||
+        _stroke != null ||
+        _transform != null ||
+        _busy ||
+        _gpuBuilding) {
+      return;
+    }
     _gpuBuilding = true;
     final generation = _gpuGeneration;
     ui.Image? image;
@@ -1025,12 +1064,18 @@ class EditorController extends ChangeNotifier {
       return;
     } finally {
       _gpuBuilding = false;
-      if (!_disposed && generation != _gpuGeneration && _stroke == null) {
+      if (!_disposed &&
+          generation != _gpuGeneration &&
+          _stroke == null &&
+          _transform == null) {
         _gpuTimer?.cancel();
         _gpuTimer = Timer(const Duration(milliseconds: 110), _refreshGpu);
       }
     }
-    if (_disposed || generation != _gpuGeneration || _stroke != null) {
+    if (_disposed ||
+        generation != _gpuGeneration ||
+        _stroke != null ||
+        _transform != null) {
       image?.dispose();
       return;
     }
@@ -1045,6 +1090,7 @@ class EditorController extends ChangeNotifier {
 
   Future<Uint8List> exportPng() async {
     if (_stroke != null) await endStroke();
+    if (_transform != null) await commitTransform();
     ui.Image? image;
     try {
       image = await _buildGpuComposite();

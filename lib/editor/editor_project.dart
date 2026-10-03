@@ -4,6 +4,7 @@ part of 'editor_controller.dart';
 extension EditorProjects on EditorController {
   Future<Uint8List> exportProject() async {
     if (_stroke != null) await endStroke();
+    if (hasActiveTransform) await commitTransform();
     if (_busy || _disposed) throw StateError('다른 작업을 처리 중입니다.');
     final estimate = _layers.fold<int>(
       0,
@@ -81,6 +82,7 @@ extension EditorProjects on EditorController {
     if (_busy || _disposed || _stroke != null) {
       throw StateError('다른 작업을 처리 중입니다.');
     }
+    if (hasActiveTransform) cancelTransform();
     if (bytes.length > 128 << 20) {
       throw const FormatException('프로젝트 파일은 128MiB 이하여야 합니다.');
     }
