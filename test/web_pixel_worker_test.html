@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Luma Pixel Worker tests</title>
+<script src="../web/editor_pixels.js"></script>
+<body><pre id="results">Running Pixel Worker tests...</pre>
+<script>
+(async () => {
+  const output = document.querySelector('#results');
+  let assertions = 0;
+  function assert(condition, message) {
+    assertions++;
+    if (!condition) throw new Error(message);
+  }
+  function compare(actual, expected, message) {
+    assert(actual.length === expected.length, message + ' length');
+    expected.forEach((value, i) => assert(actual[i] === value, message + ' channel ' + i));
+  }
+  try {
+    const pixels = new Uint8Array([32, 64, 128, 255, 255, 0, 0, 128, 90, 60, 120, 0, 255, 255, 255, 255]);
+    const original = Array.from(pixels);
+    compare(await lumaPixels.filter({pixels, width: 2, height: 2, filter: 'invert', amount: 1}),
+      [223, 191, 127, 255, 0, 128, 128, 128, 0, 0, 0, 0, 0, 0, 0, 255], 'Worker invert/alpha');
+    compare(pixels, original, 'Original input must remain attached for fallback');
+
+    const separated = new Uint8Array([
+      255, 255, 255, 255, 0, 0, 0, 255, 255, 255, 255, 255,
+      255, 255, 255, 255, 0, 0, 0, 255, 255, 255, 255, 255,
+    ]);
+    compare(await lumaPixels.region({pixels: separated, width: 3, height: 2, x: 0, y: 0, tolerance: 0}),
+      [0, 0, 1, 0, 1, 1], 'Connected region must stop at barrier');
+    let rejected = false;
+    try { await lumaPixels.filter({pixels, width: 3, height: 3, filter: 'invert', amount: 1}); }
+    catch (_) { rejected = true; }
+    assert(rejected, 'Invalid buffer must reject');
+    compare(await lumaPixels.filter({pixels, width: 2, height: 2, filter: 'invert', amount: 1}),
+      [223, 191, 127, 255, 0, 128, 128, 128, 0, 0, 0, 0, 0, 0, 0, 255], 'Worker must survive an invalid request');
+
+    // This timer must run before a substantial pixel task completes. A
+    // synchronous main-thread kernel would finish before the timer fires.
+    let heartbeat = false;
+    const large = new Uint8Array(1024 * 1024 * 4).fill(255);
+    setTimeout(() => { heartbeat = true; }, 0);
+    const operation = lumaPixels.filter({pixels: large, width: 1024, height: 1024, filter: 'sharpen', amount: 1});
+    const result = await operation;
+    assert(heartbeat, 'Main browser event loop must run while Worker computes');
+    assert(result.length === large.length && result[0] === 255, 'Large Worker result');
+    output.textContent = `PASS: ${assertions} real Worker assertions for pixels, alpha, connectivity, transfer safety, failures and UI responsiveness.`;
+    document.body.dataset.result = 'pass';
+  } catch (error) {
+    output.textContent = 'FAIL: ' + error.stack;
+    document.body.dataset.result = 'fail';
+  }
+})();
+</script></body></html>

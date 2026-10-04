@@ -9,7 +9,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart' show compute;
 
 import '../services/gpu_compositor.dart';
+import '../services/pixel_worker.dart';
 import 'editor_models.dart';
+import 'editor_project_schema.dart';
 
 export 'editor_models.dart';
 
@@ -32,7 +34,7 @@ class EditorController extends ChangeNotifier {
   List<EditorLayer> _layers = [];
   String? _activeLayerId;
   EditorTool _tool = EditorTool.brush;
-  Color _brushColor = const Color(0xff7865e9);
+  Color _brushColor = const Color(0xff000000);
   double _brushSize = 30;
   double _brushOpacity = 1;
   Rect? _selection;
@@ -47,7 +49,11 @@ class EditorController extends ChangeNotifier {
   bool _busy = false;
   bool _disposed = false;
   int _revision = 0;
+  int _paintRevision = 0;
   int _nextId = 0;
+  int _documentToken = 0;
+  int _nextDocumentToken = 0;
+  int _savedDocumentToken = 0;
   final List<_HistoryEntry> _undo = [];
   final List<_HistoryEntry> _redo = [];
   final Set<ui.Image> _images = HashSet.identity();
@@ -55,6 +61,7 @@ class EditorController extends ChangeNotifier {
   String _transactionLabel = '';
   bool _transactionChanged = false;
   _Stroke? _stroke;
+  Future<void>? _strokeCompletion;
   _TransformSession? _transform;
   Timer? _gpuTimer;
   ui.Image? _gpuImage;
@@ -96,6 +103,31 @@ class EditorController extends ChangeNotifier {
   bool get canRedo =>
       !_busy && _stroke == null && !_transactionChanged && _redo.isNotEmpty;
   int get revision => _revision;
+  int get paintRevision => _paintRevision;
+
+  /// Identifies document content across edits and Undo/Redo, unlike revision,
+  /// which also changes for transient rendering previews.
+  int get documentToken => _documentToken;
+  bool get isDirty =>
+      _documentToken != _savedDocumentToken ||
+      _stroke != null ||
+      (_transform != null && _transactionChanged);
+
+  /// Pass the token captured after export when saving involves an async picker.
+  /// Subsequent edits must remain dirty even if the earlier save succeeds.
+  void markSaved({int? token}) {
+    if (_disposed) return;
+    _savedDocumentToken = token ?? _documentToken;
+    _notify();
+  }
+
+  /// Recovered autosave data has not yet been explicitly saved by the user.
+  void markUnsaved() {
+    if (_disposed) return;
+    _savedDocumentToken = -1;
+    _notify();
+  }
+
   int get historyLength => _undo.length;
   int get historyBytes => _retainedImages().fold(
     0,
@@ -110,6 +142,35 @@ class EditorController extends ChangeNotifier {
   }
 
   String _id() => 'layer-${_nextId++}';
+  bool get _canStartOperation => !_disposed && !_busy && _stroke == null;
+
+  /// Image/document commands cannot interrupt a live stroke. Async commands
+  /// also settle slider transactions before acquiring the busy state.
+  bool _prepareOperation({bool settleTransaction = false}) {
+    if (!_canStartOperation) return false;
+    cancelTransform();
+    if (settleTransaction) commitTransaction();
+    return true;
+  }
+
+  void _documentChanged() => _documentToken = ++_nextDocumentToken;
+
+  void _resetDocumentIdentity() {
+    _documentChanged();
+    _savedDocumentToken = _documentToken;
+    _transactionChanged = false;
+  }
+
+  void _validateAdditionalLayers({int layers = 0, int masks = 0}) {
+    EditorProjectSchema.validateLayerCount(_layers.length + layers);
+    EditorProjectSchema.validateDecodedBudget(
+      _documentSize.width.toInt(),
+      _documentSize.height.toInt(),
+      layerCount: _layers.length + layers,
+      maskCount: _layers.where((layer) => layer.mask != null).length + masks,
+    );
+  }
+
   _Snapshot _snapshot() => _Snapshot(
     _documentSize,
     List.of(_layers),
@@ -117,9 +178,15 @@ class EditorController extends ChangeNotifier {
     _selection,
     selectionPath,
     _selectionKind,
+    _documentToken,
   );
 
   void beginTransaction(String label) {
+    if (!_canStartOperation || _transform != null) return;
+    _beginTransaction(label);
+  }
+
+  void _beginTransaction(String label) {
     if (_disposed || _transaction != null) return;
     _transaction = _snapshot();
     _transactionLabel = label;
@@ -151,15 +218,17 @@ class EditorController extends ChangeNotifier {
   void _edit(String label, VoidCallback action) {
     if (_transform != null) cancelTransform();
     final ownsTransaction = _transaction == null;
-    if (ownsTransaction) beginTransaction(label);
+    if (ownsTransaction) _beginTransaction(label);
     action();
     _transactionChanged = true;
+    _documentChanged();
     _contentChanged();
     if (ownsTransaction) commitTransaction();
   }
 
   void _contentChanged() {
     _revision++;
+    _paintRevision++;
     _gpuGeneration++;
     _gpuImage?.dispose();
     _gpuImage = null;
@@ -178,13 +247,14 @@ class EditorController extends ChangeNotifier {
     _selection = state.selection;
     _selectionPath = state.path == null ? null : Path.from(state.path!);
     _selectionKind = state.kind;
+    _documentToken = state.documentToken;
     _cloneSource = null;
     _cloneSourcePickMode = false;
     _contentChanged();
   }
 
   void undo() {
-    if (_busy || _stroke != null) return;
+    if (!_canStartOperation) return;
     if (_transform != null) {
       final changed = _transactionChanged;
       cancelTransform();
@@ -199,7 +269,7 @@ class EditorController extends ChangeNotifier {
   }
 
   void redo() {
-    if (_busy || _stroke != null) return;
+    if (!_canStartOperation) return;
     if (_transform != null) cancelTransform();
     commitTransaction();
     if (_redo.isEmpty) return;
@@ -233,8 +303,18 @@ class EditorController extends ChangeNotifier {
         _redo.removeAt(0);
       }
     }
-    while (historyBytes > maxHistoryBytes &&
-        (_undo.isNotEmpty || _redo.isNotEmpty)) {
+    final baseline = HashSet<ui.Image>.identity()
+      ..addAll(_layers.map((layer) => layer.image))
+      ..addAll(_layers.map((layer) => layer.mask).whereType<ui.Image>());
+    if (_clipboard != null) baseline.add(_clipboard!);
+    final baselineBytes = baseline.fold<int>(
+      0,
+      (sum, image) => sum + image.width * image.height * 4,
+    );
+    // Current content cannot be evicted. When it exceeds the normal total
+    // budget, preserve history that costs no additional image memory.
+    final budget = math.max(maxHistoryBytes, baselineBytes);
+    while (historyBytes > budget && (_undo.isNotEmpty || _redo.isNotEmpty)) {
       if (_undo.isNotEmpty) {
         _undo.removeAt(0);
       } else {
@@ -270,10 +350,8 @@ class EditorController extends ChangeNotifier {
   }
 
   Future<void> newDocument(int width, int height) async {
-    if (_busy) return;
-    if (width < 1 || height < 1 || width > 4096 || height > 4096) {
-      throw ArgumentError('문서 크기는 1~4096 픽셀이어야 합니다.');
-    }
+    if (_busy || _disposed) return;
+    EditorProjectSchema.validateDocumentSize(width, height);
     cancelStroke();
     cancelTransform();
     _busy = true;
@@ -298,6 +376,7 @@ class EditorController extends ChangeNotifier {
       _selectionKind = null;
       _cloneSource = null;
       _cloneSourcePickMode = false;
+      _resetDocumentIdentity();
       _contentChanged();
       _collectUnusedImages();
     } finally {
@@ -307,8 +386,10 @@ class EditorController extends ChangeNotifier {
   }
 
   Future<void> addLayer({String? name}) async {
-    if (_busy) return;
-    cancelTransform();
+    if (!_canStartOperation) return;
+    if (name != null) EditorProjectSchema.validateLayerName(name);
+    _validateAdditionalLayers(layers: 1);
+    if (!_prepareOperation(settleTransaction: true)) return;
     _busy = true;
     _notify();
     try {
@@ -335,7 +416,7 @@ class EditorController extends ChangeNotifier {
   }
 
   void selectLayer(String id) {
-    if (_busy || _stroke != null || !_layers.any((layer) => layer.id == id)) {
+    if (!_canStartOperation || !_layers.any((layer) => layer.id == id)) {
       return;
     }
     if (id != _activeLayerId) cancelTransform();
@@ -344,7 +425,7 @@ class EditorController extends ChangeNotifier {
   }
 
   void removeActiveLayer() {
-    if (!_busy) cancelTransform();
+    if (!_prepareOperation()) return;
     final index = _layers.indexWhere((layer) => layer.id == _activeLayerId);
     if (_busy || index < 0 || _layers[index].locked) return;
     _edit('레이어 삭제', () {
@@ -356,10 +437,17 @@ class EditorController extends ChangeNotifier {
   }
 
   void duplicateActiveLayer() {
-    if (!_busy) cancelTransform();
+    if (!_prepareOperation()) return;
     final layer = activeLayer;
     if (_busy || layer == null) return;
-    final duplicate = layer.copyWith(id: _id(), name: '${layer.name} 복사');
+    _validateAdditionalLayers(layers: 1, masks: layer.mask == null ? 0 : 1);
+    final name = '${layer.name} 복사';
+    final duplicate = layer.copyWith(
+      id: _id(),
+      name: name.length <= EditorProjectSchema.maxLayerNameLength
+          ? name
+          : '복제한 레이어',
+    );
     _edit('레이어 복제', () {
       _layers.insert(_layers.indexOf(layer) + 1, duplicate);
       _activeLayerId = duplicate.id;
@@ -367,7 +455,7 @@ class EditorController extends ChangeNotifier {
   }
 
   void moveLayer(String id, int delta) {
-    if (!_busy) cancelTransform();
+    if (!_prepareOperation()) return;
     final index = _layers.indexWhere((layer) => layer.id == id);
     if (_busy || index < 0 || _layers[index].locked) return;
     final target = (index + delta).clamp(0, _layers.length - 1);
@@ -384,7 +472,7 @@ class EditorController extends ChangeNotifier {
     String label, {
     bool allowLocked = false,
   }) {
-    if (!_busy) cancelTransform();
+    if (!_prepareOperation()) return;
     final index = _layers.indexWhere((layer) => layer.id == id);
     if (_busy || index < 0 || (!allowLocked && _layers[index].locked)) return;
     _edit(label, () {
@@ -405,6 +493,7 @@ class EditorController extends ChangeNotifier {
     allowLocked: true,
   );
   void renameLayer(String id, String name) {
+    EditorProjectSchema.validateLayerName(name);
     if (name.trim().isEmpty) return;
     _replaceLayer(
       id,
@@ -425,6 +514,7 @@ class EditorController extends ChangeNotifier {
   }
 
   void setLayerBlendMode(ui.BlendMode value) {
+    EditorProjectSchema.validateBlendMode(value);
     if (_activeLayerId != null && activeLayer!.blendMode != value) {
       _replaceLayer(
         _activeLayerId!,
@@ -474,8 +564,7 @@ class EditorController extends ChangeNotifier {
   }
 
   void setSelection(Rect? value) {
-    if (_busy) return;
-    cancelTransform();
+    if (!_prepareOperation()) return;
     final bounds = Offset.zero & _documentSize;
     final selected = value?.intersect(bounds);
     _selection = selected == null || selected.isEmpty ? null : selected;
@@ -492,6 +581,11 @@ class EditorController extends ChangeNotifier {
   }
 
   void setLayerTransform({Offset? offset, double? rotation, double? scale}) {
+    EditorProjectSchema.validateTransform(
+      offset: offset,
+      rotation: rotation,
+      scale: scale,
+    );
     if (_activeLayerId == null) return;
     _replaceLayer(
       _activeLayerId!,
@@ -529,7 +623,7 @@ class EditorController extends ChangeNotifier {
   }
 
   void beginStroke(Offset point, {double pressure = 1}) {
-    if (!_busy) cancelTransform();
+    if (!_prepareOperation(settleTransaction: true)) return;
     final layer = activeLayer;
     if (_busy ||
         layer == null ||
@@ -544,7 +638,7 @@ class EditorController extends ChangeNotifier {
         (_tool == EditorTool.cloneStamp && _cloneSource == null)) {
       return;
     }
-    beginTransaction(_tool == EditorTool.eraser ? '지우개' : '브러시');
+    _beginTransaction(_tool == EditorTool.eraser ? '지우개' : '브러시');
     _stroke = _Stroke(
       layer,
       _tool == EditorTool.eraser,
@@ -572,12 +666,30 @@ class EditorController extends ChangeNotifier {
       return;
     }
     stroke.points.add(_StrokePoint(local, effectivePressure));
+    _paintRevision++;
     _notify();
   }
 
-  Future<void> endStroke() async {
+  Future<void> endStroke() {
+    if (_strokeCompletion != null) return _strokeCompletion!;
     final stroke = _stroke;
-    if (stroke == null || _busy) return;
+    if (stroke == null || _busy || _disposed) return Future<void>.value();
+    final completion = Completer<void>();
+    _strokeCompletion = completion.future;
+    unawaited(() async {
+      try {
+        await _finishStroke(stroke);
+        completion.complete();
+      } catch (error, stack) {
+        completion.completeError(error, stack);
+      } finally {
+        _strokeCompletion = null;
+      }
+    }());
+    return completion.future;
+  }
+
+  Future<void> _finishStroke(_Stroke stroke) async {
     _busy = true;
     _notify();
     try {
@@ -594,6 +706,7 @@ class EditorController extends ChangeNotifier {
       if (index >= 0) {
         _layers[index] = _layers[index].copyWith(image: image, clearText: true);
         _transactionChanged = true;
+        _documentChanged();
       }
       _stroke = null;
       _contentChanged();
@@ -798,8 +911,11 @@ class EditorController extends ChangeNotifier {
   }
 
   Future<void> importImage(Uint8List bytes, String name) async {
-    if (_busy) return;
-    cancelTransform();
+    if (!_canStartOperation) return;
+    EditorProjectSchema.validateLayerName(
+      name.trim().isEmpty ? '가져온 이미지' : name,
+    );
+    _validateAdditionalLayers(layers: 1);
     _busy = true;
     _notify();
     ui.Codec? codec;
@@ -847,6 +963,10 @@ class EditorController extends ChangeNotifier {
         image.dispose();
         return;
       }
+      // Failed decoding leaves the existing preview intact. Settle its
+      // transaction before adopting the completed image into retained resources.
+      cancelTransform();
+      commitTransaction();
       _images.add(image);
       final layer = EditorLayer(
         id: _id(),
@@ -901,8 +1021,15 @@ class EditorController extends ChangeNotifier {
     Offset? position,
     String? fontFamily,
   }) async {
-    if (_busy || text.trim().isEmpty) return;
-    cancelTransform();
+    if (!_canStartOperation || text.trim().isEmpty) {
+      return;
+    }
+    EditorProjectSchema.validateText(text);
+    EditorProjectSchema.validateFontSize(fontSize);
+    EditorProjectSchema.validateFontFamily(fontFamily ?? 'sans-serif');
+    if (position != null) EditorProjectSchema.validatePoint(position);
+    _validateAdditionalLayers(layers: 1);
+    if (!_prepareOperation(settleTransaction: true)) return;
     _busy = true;
     _notify();
     try {
@@ -943,8 +1070,8 @@ class EditorController extends ChangeNotifier {
     Color? color,
     String? fontFamily,
   }) async {
-    if (!_busy) cancelTransform();
-    final layer = activeLayer;
+    if (!_canStartOperation) return;
+    final layer = _transform?.layer ?? activeLayer;
     if (_busy ||
         layer == null ||
         !layer.isText ||
@@ -952,6 +1079,10 @@ class EditorController extends ChangeNotifier {
         text.trim().isEmpty) {
       return;
     }
+    EditorProjectSchema.validateText(text);
+    EditorProjectSchema.validateFontSize(fontSize ?? layer.fontSize);
+    EditorProjectSchema.validateFontFamily(fontFamily ?? layer.fontFamily);
+    if (!_prepareOperation(settleTransaction: true)) return;
     _busy = true;
     _notify();
     try {
@@ -997,52 +1128,60 @@ class EditorController extends ChangeNotifier {
   Future<ui.Image?> _buildGpuComposite() async {
     if (!supportsWebGl) return null;
     final size = _documentSize;
-    final rasterized = <Future<ui.Image>>[];
-    final temporaryImages = <ui.Image>[];
-    final visible = _layers.where((layer) => layer.visible).toList();
-    // Record all pictures before awaiting, to pin the source image resources.
-    for (final layer in visible) {
-      rasterized.add(
-        _raster(
+    final session = beginWebGlComposite(
+      width: size.width.round(),
+      height: size.height.round(),
+    );
+    if (session == null) return null;
+    final pinned = <EditorLayer>[];
+    try {
+      // Clones pin backing resources across awaits while history eviction or
+      // document replacement may release the original image handles.
+      for (final layer in _layers.where((layer) => layer.visible)) {
+        final image = layer.image.clone();
+        try {
+          pinned.add(layer.copyWith(image: image, mask: layer.mask?.clone()));
+        } catch (_) {
+          image.dispose();
+          rethrow;
+        }
+      }
+      // Stream one layer at a time instead of retaining N document-sized
+      // rasters and RGBA buffers before uploading them to WebGL.
+      for (final layer in pinned) {
+        if (_disposed) return null;
+        final image = await _raster(
           (canvas) => _paintLayer(canvas, layer, applyComposite: false),
           size: size,
-        ).then((image) {
-          temporaryImages.add(image);
-          return image;
-        }),
-      );
-    }
-    try {
-      // Future.wait waits for every allocation even when one fails, letting
-      // the finally block release all successfully allocated temporary images.
-      final images = await Future.wait(rasterized);
-      final gpuLayers = <GpuLayer>[];
-      for (var index = 0; index < images.length; index++) {
-        final image = images[index];
-        final bytes = await image.toByteData(
-          format: ui.ImageByteFormat.rawStraightRgba,
         );
-        if (bytes == null) return null;
-        gpuLayers.add(
-          GpuLayer(
-            rgba: bytes.buffer.asUint8List(
-              bytes.offsetInBytes,
-              bytes.lengthInBytes,
-            ),
-            opacity: visible[index].opacity,
-            blendMode: _blendName(visible[index].blendMode),
-          ),
-        );
+        try {
+          final bytes = await image.toByteData(
+            format: ui.ImageByteFormat.rawStraightRgba,
+          );
+          if (bytes == null ||
+              !session.add(
+                GpuLayer(
+                  rgba: bytes.buffer.asUint8List(
+                    bytes.offsetInBytes,
+                    bytes.lengthInBytes,
+                  ),
+                  opacity: layer.opacity,
+                  blendMode: _blendName(layer.blendMode),
+                ),
+              )) {
+            return null;
+          }
+        } finally {
+          image.dispose();
+        }
       }
-      return await compositeWebGl(
-        width: size.width.round(),
-        height: size.height.round(),
-        layers: gpuLayers,
-      );
+      return await session.finish();
     } finally {
-      for (final image in temporaryImages) {
-        image.dispose();
+      for (final layer in pinned) {
+        layer.image.dispose();
+        layer.mask?.dispose();
       }
+      session.dispose();
     }
   }
 
@@ -1083,6 +1222,7 @@ class EditorController extends ChangeNotifier {
       _gpuImage?.dispose();
       _gpuImage = image;
       _gpuRevision = _revision;
+      _paintRevision++;
       _renderer = 'WebGL shaders';
       _notify();
     }
@@ -1091,21 +1231,27 @@ class EditorController extends ChangeNotifier {
   Future<Uint8List> exportPng() async {
     if (_stroke != null) await endStroke();
     if (_transform != null) await commitTransform();
+    if (_busy || _disposed) throw StateError('다른 작업을 처리 중입니다.');
+    commitTransaction();
+    _busy = true;
+    _notify();
     ui.Image? image;
     try {
-      image = await _buildGpuComposite();
-    } catch (_) {
-      /* Canvas fallback. */
-    }
-    image ??= await _raster(
-      (canvas) => paintDocument(canvas, includeStroke: false),
-    );
-    try {
+      try {
+        image = await _buildGpuComposite();
+      } catch (_) {
+        /* Canvas fallback. */
+      }
+      image ??= await _raster(
+        (canvas) => paintDocument(canvas, includeStroke: false),
+      );
       final bytes = await image.toByteData(format: ui.ImageByteFormat.png);
       if (bytes == null) throw StateError('PNG 인코딩에 실패했습니다.');
       return bytes.buffer.asUint8List(bytes.offsetInBytes, bytes.lengthInBytes);
     } finally {
-      image.dispose();
+      image?.dispose();
+      _busy = false;
+      _notify();
     }
   }
 
@@ -1263,6 +1409,7 @@ class EditorController extends ChangeNotifier {
       if (_disposed) return;
       _layers = demo;
       _activeLayerId = demo.last.id;
+      _resetDocumentIdentity();
       _contentChanged();
     } finally {
       _busy = false;
@@ -1292,6 +1439,7 @@ class _Snapshot {
     this.selection,
     this.path,
     this.kind,
+    this.documentToken,
   );
   final Size size;
   final List<EditorLayer> layers;
@@ -1299,6 +1447,7 @@ class _Snapshot {
   final Rect? selection;
   final Path? path;
   final EditorSelectionKind? kind;
+  final int documentToken;
 }
 
 class _HistoryEntry {

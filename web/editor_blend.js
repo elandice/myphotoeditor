@@ -109,7 +109,10 @@
     }
   }
 
-  function composite(width, height, layers) {
+  // A session consumes one layer at a time. The caller can release its raster
+  // and readback bytes immediately after add(), instead of retaining L full
+  // document buffers while composing L layers.
+  function begin(width, height) {
     if (!available()) return null;
     const r = renderer;
     const gl = r.gl;
@@ -117,8 +120,6 @@
     if (!Number.isInteger(width) || !Number.isInteger(height)
       || width < 1 || height < 1 || width > maxSize || height > maxSize) return null;
     const byteCount = width * height * 4;
-    if (layers.some(layer => !(layer.rgba instanceof Uint8Array)
-      || layer.rgba.length !== byteCount)) return null;
     const textures = [];
     const framebuffers = [];
     function texture(data) {
@@ -143,7 +144,11 @@
         throw new Error('WebGL framebuffer is incomplete.');
       return result;
     }
-    try {
+    let current = 0;
+    let disposed = false;
+    let failed = false;
+    let targets, buffers, source;
+    function configure() {
       gl.useProgram(r.program);
       gl.disable(gl.BLEND);
       gl.disable(gl.DITHER);
@@ -153,18 +158,41 @@
       gl.bindBuffer(gl.ARRAY_BUFFER, r.quad);
       gl.enableVertexAttribArray(r.position);
       gl.vertexAttribPointer(r.position, 2, gl.FLOAT, false, 0, 0);
-      const targets = [texture(null), texture(null)];
-      const buffers = targets.map(framebuffer);
-      const source = texture(null);
+      gl.uniform1i(r.backdrop, 0);
+      gl.uniform1i(r.source, 1);
+    }
+    function dispose() {
+      if (disposed) return;
+      disposed = true;
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      for (const value of framebuffers) gl.deleteFramebuffer(value);
+      for (const value of textures) gl.deleteTexture(value);
+    }
+    try {
+      configure();
+      targets = [texture(null), texture(null)];
+      buffers = targets.map(framebuffer);
+      source = texture(null);
       gl.bindFramebuffer(gl.FRAMEBUFFER, buffers[0]);
       gl.clearColor(0, 0, 0, 0);
       gl.clear(gl.COLOR_BUFFER_BIT);
-      let current = 0;
-      gl.uniform1i(r.backdrop, 0);
-      gl.uniform1i(r.source, 1);
-      for (const layer of layers) {
+      if (gl.getError() !== gl.NO_ERROR) throw new Error('WebGL allocation failed.');
+    } catch (_) {
+      dispose();
+      return null;
+    }
+    function add(layer) {
+      if (disposed || failed || renderer !== r || gl.isContextLost()) return false;
+      if (!(layer.rgba instanceof Uint8Array) || layer.rgba.length !== byteCount) {
+        failed = true;
+        return false;
+      }
+      try {
         const opacity = Math.max(0, Math.min(1, Number(layer.opacity)));
-        if (!Number.isFinite(opacity) || opacity === 0) continue;
+        if (!Number.isFinite(opacity) || opacity === 0) return true;
+        // Export and preview sessions may interleave across Dart awaits.
+        // Restore all shared GL state for every pass.
+        configure();
         gl.bindFramebuffer(gl.FRAMEBUFFER, buffers[1 - current]);
         gl.activeTexture(gl.TEXTURE0);
         gl.bindTexture(gl.TEXTURE_2D, targets[current]);
@@ -176,20 +204,42 @@
         gl.uniform1i(r.mode, modes[layer.blendMode] ?? 0);
         gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
         current = 1 - current;
+        failed = gl.getError() !== gl.NO_ERROR;
+        return !failed;
+      } catch (_) {
+        failed = true;
+        return false;
       }
-      gl.bindFramebuffer(gl.FRAMEBUFFER, buffers[current]);
-      const output = new Uint8Array(byteCount);
-      // Typed-array row zero is uploaded at v=0 and read back at y=0, so
-      // logical top-to-bottom document row order survives without flipping.
-      gl.readPixels(0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, output);
-      return gl.getError() === gl.NO_ERROR ? output : null;
-    } catch (_) {
-      return null;
+    }
+    function finish() {
+      if (disposed) return null;
+      try {
+        if (failed || renderer !== r || gl.isContextLost()) return null;
+        gl.bindFramebuffer(gl.FRAMEBUFFER, buffers[current]);
+        const output = new Uint8Array(byteCount);
+        // Upload and readback use the same row order, without a Y flip.
+        gl.readPixels(0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, output);
+        return gl.getError() === gl.NO_ERROR ? output : null;
+      } catch (_) {
+        return null;
+      } finally {
+        dispose();
+      }
+    }
+    return Object.freeze({add, finish, dispose});
+  }
+
+  function composite(width, height, layers) {
+    const session = begin(width, height);
+    if (!session) return null;
+    try {
+      for (const layer of layers) {
+        if (!session.add(layer)) return null;
+      }
+      return session.finish();
     } finally {
-      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-      for (const value of framebuffers) gl.deleteFramebuffer(value);
-      for (const value of textures) gl.deleteTexture(value);
+      session.dispose();
     }
   }
-  window.lumaBlend = Object.freeze({available, composite});
+  window.lumaBlend = Object.freeze({available, begin, composite});
 })();

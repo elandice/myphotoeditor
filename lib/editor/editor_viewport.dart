@@ -8,6 +8,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'editor_controller.dart';
+import 'editor_project_schema.dart';
 
 /// The document-to-screen transform, shared by the canvas and zoom controls.
 class ViewportController extends ChangeNotifier {
@@ -106,11 +107,13 @@ class EditorViewport extends StatefulWidget {
     required this.controller,
     required this.viewportController,
     this.showGrid = false,
+    this.onDialogStateChanged,
   });
 
   final EditorController controller;
   final ViewportController viewportController;
   final bool showGrid;
+  final ValueChanged<bool>? onDialogStateChanged;
 
   @override
   State<EditorViewport> createState() => _EditorViewportState();
@@ -668,6 +671,7 @@ class _EditorViewportState extends State<EditorViewport>
   Future<void> _editText(Offset position) async {
     if (_textDialogOpen) return;
     _textDialogOpen = true;
+    widget.onDialogStateChanged?.call(true);
     final layer = editor.activeLayer;
     final editing = layer != null && layer.isText;
     try {
@@ -696,7 +700,12 @@ class _EditorViewportState extends State<EditorViewport>
         const SnackBar(content: Text('텍스트를 적용하지 못했습니다. 다시 시도해 주세요.')),
       );
     } finally {
+      // A dialog result arrives before its route has finished dismissing.
+      // Keep recovery/export from locking the editor until text application
+      // and the dialog's controller disposal have both had time to finish.
+      await Future<void>.delayed(const Duration(milliseconds: 250));
       _textDialogOpen = false;
+      if (mounted) widget.onDialogStateChanged?.call(false);
     }
   }
 
@@ -778,19 +787,35 @@ class _EditorViewportState extends State<EditorViewport>
                         event.localPosition + event.pan - anchor * zoom,
                       );
                     },
-                    child: RepaintBoundary(
-                      child: CustomPaint(
-                        size: size,
-                        painter: _ViewportPainter(
-                          editor: editor,
-                          viewport: viewport,
-                          ants: _ants,
-                          hover: _hover,
-                          preview: _preview,
-                          cloneCursor: _cloneCursor,
-                          showGrid: widget.showGrid,
+                    child: Stack(
+                      fit: StackFit.expand,
+                      children: [
+                        RepaintBoundary(
+                          child: CustomPaint(
+                            key: const ValueKey('editor-document-paint'),
+                            size: size,
+                            painter: _DocumentPainter(
+                              editor: editor,
+                              viewport: viewport,
+                            ),
+                          ),
                         ),
-                      ),
+                        RepaintBoundary(
+                          child: CustomPaint(
+                            key: const ValueKey('editor-overlay-paint'),
+                            size: size,
+                            painter: _OverlayPainter(
+                              editor: editor,
+                              viewport: viewport,
+                              ants: _ants,
+                              hover: _hover,
+                              preview: _preview,
+                              cloneCursor: _cloneCursor,
+                              showGrid: widget.showGrid,
+                            ),
+                          ),
+                        ),
+                      ],
                     ),
                   ),
                 ),
@@ -833,42 +858,29 @@ _TransformShape? _transformShape(
   return _TransformShape(corners, top + direction * 34);
 }
 
-class _ViewportPainter extends CustomPainter {
-  _ViewportPainter({
-    required this.editor,
-    required this.viewport,
-    required this.ants,
-    required this.hover,
-    required this.preview,
-    required this.cloneCursor,
-    required this.showGrid,
-  }) : super(
-         repaint: Listenable.merge([
-           editor,
-           viewport,
-           ants,
-           hover,
-           preview,
-           cloneCursor,
-         ]),
-       );
+// Retain the document display list while selection ants and cursors animate.
+// Capture values rather than comparing the mutable controllers themselves.
+class _DocumentPainter extends CustomPainter {
+  _DocumentPainter({required this.editor, required ViewportController viewport})
+    : paintRevision = editor.paintRevision,
+      pan = viewport.pan,
+      zoom = viewport.zoom,
+      documentSize = editor.documentSize;
 
   final EditorController editor;
-  final ViewportController viewport;
-  final Animation<double> ants;
-  final ValueNotifier<Offset?> hover;
-  final ValueNotifier<_ToolPreview?> preview;
-  final ValueNotifier<Offset?> cloneCursor;
-  final bool showGrid;
+  final int paintRevision;
+  final Offset pan;
+  final double zoom;
+  final Size documentSize;
 
   @override
   void paint(Canvas canvas, Size size) {
     canvas.drawColor(const Color(0xFFEEF0F4), BlendMode.src);
     final paper = Rect.fromLTWH(
-      viewport.pan.dx,
-      viewport.pan.dy,
-      editor.documentSize.width * viewport.zoom,
-      editor.documentSize.height * viewport.zoom,
+      pan.dx,
+      pan.dy,
+      documentSize.width * zoom,
+      documentSize.height * zoom,
     );
     canvas.drawShadow(
       Path()..addRect(paper),
@@ -903,9 +915,68 @@ class _ViewportPainter extends CustomPainter {
         }
       }
     }
+    canvas.translate(pan.dx, pan.dy);
+    canvas.scale(zoom);
+    editor.paintDocument(canvas);
+    canvas.restore();
+    canvas.drawRect(
+      paper,
+      Paint()
+        ..color = const Color(0x180D1733)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1,
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant _DocumentPainter oldDelegate) =>
+      editor != oldDelegate.editor ||
+      paintRevision != oldDelegate.paintRevision ||
+      pan != oldDelegate.pan ||
+      zoom != oldDelegate.zoom ||
+      documentSize != oldDelegate.documentSize;
+}
+
+class _OverlayPainter extends CustomPainter {
+  _OverlayPainter({
+    required this.editor,
+    required this.viewport,
+    required this.ants,
+    required this.hover,
+    required this.preview,
+    required this.cloneCursor,
+    required this.showGrid,
+  }) : super(
+         repaint: Listenable.merge([
+           editor,
+           viewport,
+           ants,
+           hover,
+           preview,
+           cloneCursor,
+         ]),
+       );
+
+  final EditorController editor;
+  final ViewportController viewport;
+  final Animation<double> ants;
+  final ValueNotifier<Offset?> hover;
+  final ValueNotifier<_ToolPreview?> preview;
+  final ValueNotifier<Offset?> cloneCursor;
+  final bool showGrid;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paper = Rect.fromLTWH(
+      viewport.pan.dx,
+      viewport.pan.dy,
+      editor.documentSize.width * viewport.zoom,
+      editor.documentSize.height * viewport.zoom,
+    );
+    canvas.save();
+    canvas.clipRect(paper);
     canvas.translate(viewport.pan.dx, viewport.pan.dy);
     canvas.scale(viewport.zoom);
-    editor.paintDocument(canvas);
     _paintToolPreview(canvas);
     if (showGrid) {
       var step = 100.0;
@@ -931,13 +1002,6 @@ class _ViewportPainter extends CustomPainter {
       }
     }
     canvas.restore();
-    canvas.drawRect(
-      paper,
-      Paint()
-        ..color = const Color(0x180D1733)
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = 1,
-    );
 
     final selection = editor.selectionPath;
     if (selection != null) {
@@ -1227,7 +1291,7 @@ class _ViewportPainter extends CustomPainter {
   }
 
   @override
-  bool shouldRepaint(covariant _ViewportPainter oldDelegate) =>
+  bool shouldRepaint(covariant _OverlayPainter oldDelegate) =>
       editor != oldDelegate.editor ||
       viewport != oldDelegate.viewport ||
       showGrid != oldDelegate.showGrid;
@@ -1272,8 +1336,15 @@ class _TextLayerDialogState extends State<_TextLayerDialog> {
 
   void _submit(bool createNew) {
     final size = double.tryParse(_size.text);
-    if (_text.text.trim().isEmpty || size == null || size < 8 || size > 800) {
-      setState(() => _error = '텍스트와 8~800 사이의 크기를 입력해 주세요.');
+    if (_text.text.trim().isEmpty || size == null) {
+      setState(() => _error = '텍스트와 1~1000 사이의 크기를 입력해 주세요.');
+      return;
+    }
+    try {
+      EditorProjectSchema.validateText(_text.text.trim());
+      EditorProjectSchema.validateFontSize(size);
+    } on ArgumentError catch (error) {
+      setState(() => _error = error.message.toString());
       return;
     }
     Navigator.pop(context, _TextResult(_text.text.trim(), size, createNew));
@@ -1289,6 +1360,7 @@ class _TextLayerDialogState extends State<_TextLayerDialog> {
         children: [
           TextField(
             controller: _text,
+            maxLength: EditorProjectSchema.maxTextLength,
             autofocus: true,
             minLines: 2,
             maxLines: 5,

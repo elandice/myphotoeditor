@@ -74,14 +74,37 @@
         {rgba: source, opacity, blendMode: mode},
       ]);
       compare(actual, reference(background, source, mode, opacity), mode + '/' + opacity);
+      const streamed = lumaBlend.begin(2, 3);
+      assert(streamed !== null, 'Streaming session must allocate');
+      if (streamed) {
+        assert(streamed.add({rgba: background, opacity: 1, blendMode: 'normal'}), 'First upload');
+        assert(streamed.add({rgba: source, opacity, blendMode: mode}), 'Second upload');
+        compare(streamed.finish(), actual, 'Streaming equivalence ' + mode + '/' + opacity);
+        assert(streamed.finish() === null, 'Finished session must not read twice');
+        assert(!streamed.add({rgba: source, opacity: 1}), 'Finished session must reject uploads');
+        streamed.dispose();
+      }
     }
   }
   compare(lumaBlend.composite(2, 3, []), new Uint8Array(24), 'Empty document');
   assert(lumaBlend.composite(2, 3, [{rgba: new Uint8Array(4), opacity: 1}]) === null,
     'Mismatched pixel buffers must be rejected');
   assert(lumaBlend.composite(0, 3, []) === null, 'Zero width must be rejected');
+  const first = lumaBlend.begin(2, 3), second = lumaBlend.begin(1, 1);
+  assert(first !== null && second !== null, 'Interleaved sessions must allocate');
+  if (first && second) {
+    first.add({rgba: background, opacity: 1, blendMode: 'normal'});
+    second.add({rgba: new Uint8Array([10, 20, 30, 255]), opacity: 1, blendMode: 'normal'});
+    first.add({rgba: source, opacity: .6, blendMode: 'overlay'});
+    compare(second.finish(), [10, 20, 30, 255], 'Interleaved small session');
+    compare(first.finish(), reference(background, source, 'overlay', .6), 'Interleaved large session');
+  }
+  const invalid = lumaBlend.begin(2, 3);
+  assert(invalid !== null && !invalid.add({rgba: new Uint8Array(4), opacity: 1}), 'Invalid streaming upload rejected');
+  assert(invalid.finish() === null, 'Failed streaming session must not return partial image');
+  invalid.dispose();
   output.textContent = failures.length ? 'FAIL\n' + failures.join('\n')
-    : `PASS: ${assertions} WebGL pixel assertions across 8 modes, 4 opacities, alpha edges, row order, repeat calls and invalid buffers.`;
+    : `PASS: ${assertions} WebGL pixel assertions across 8 modes, 4 opacities, alpha edges, row order, streaming/interleaved sessions and invalid buffers.`;
   document.body.dataset.result = failures.length ? 'fail' : 'pass';
 })();
 </script>

@@ -7,9 +7,13 @@ blend modes can use the platform's graphics backend.
 
 ## Browser shader pipeline
 
-The engine rasterizes each visible layer's transform and color adjustment to a
-document-sized image, then reads `ImageByteFormat.rawStraightRgba`. The compositor
-uploads these bytes to a WebGL texture. It runs normal, multiply, screen, overlay,
+The engine pins visible source images with shared image handles, then processes
+one layer at a time: rasterize its transform and color adjustment, read
+`ImageByteFormat.rawStraightRgba`, upload it, and release the temporary raster
+before starting the next layer. A composition session reuses its three textures
+and two framebuffer objects across all layers. Temporary layer rasters and RGBA
+readbacks therefore no longer grow with layer count. Source images and the final
+composite still occupy memory. The compositor runs normal, multiply, screen, overlay,
 darken, lighten, difference, or additive blending in a GLSL fragment shader. Two
 framebuffer textures alternate between the previous result and next output; no
 pass samples the texture it is writing.
@@ -35,12 +39,46 @@ path supplies immediate stroke previews. Missing WebGL, context loss, failed
 shader compilation, unsupported image dimensions, and framebuffer allocation
 failures return `null`, preserving the Canvas fallback.
 
+The viewport retains the document and draws selection ants, tool previews,
+handles, and cursors in a separate repaint boundary. A dedicated paint revision
+changes for image edits, stroke samples, transforms, and accepted GPU results.
+Selection animation, hover, and ordinary tool settings do not recomposite the
+document. Zoom, pan, layout changes, and content edits still repaint it.
+
+GPU composition still requires pixel readback and upload; it is not a pipeline
+that keeps all intermediate data on the GPU. `readPixels` and the final Dart
+premultiplication are synchronous browser work. Resource-count improvements do
+not establish a frame-time or total-process-memory guarantee.
+
 `test/webgl_blend_test.html` can be opened in a WebGL-enabled browser to run actual
 GPU pixel comparisons. It checks all eight modes at four opacities, transparent
-edges, vertical orientation, repeated calls, and invalid buffers. The tests also
-run in headless Chrome with SwiftShader (`--headless --use-angle=swiftshader
---enable-unsafe-swiftshader --dump-dom file:///.../test/webgl_blend_test.html`).
-Look for `body data-result="pass"`.
+edges, vertical orientation, streamed and interleaved sessions, repeated calls,
+and invalid buffers. `node scripts/test-web.mjs` runs the browser tests through a
+local HTTP server in headless Chrome with SwiftShader. Set `CHROME_BIN` when
+Chrome is outside the usual installation paths. Look for
+`body data-result="pass"` when opening a test page manually.
+
+## CPU pixel work
+
+`web/editor_pixels.js` transfers a copy of input bytes to a real Web Worker in
+`web/editor_pixel_worker.js`. Seven CPU filters and connected-region scanning
+run off the browser's UI event loop, and the worker transfers output buffers
+back. Gaussian blur continues to use Flutter's image filter. The input copy
+keeps original pixels attached and usable if the worker rejects a request.
+Worker creation, CSP restrictions, processing errors, and a 60-second timeout
+return to the Dart implementation. Native Dart uses `compute` in an isolate;
+the web fallback runs `compute` on the UI event loop and can pause interaction
+on large documents. Image readback and region-to-path construction also remain
+on the Flutter side.
+
+`node scripts/test-pixel-worker.mjs` compares worker kernels byte-for-byte with
+the current native Dart functions, covering every CPU filter, transparent and
+partially transparent pixels, percentile contrast, and connected regions. Set
+`DART_BIN` to the Dart executable if it is not available on PATH. The real Worker
+browser test additionally verifies transport, rejected requests, reuse after an
+error, preservation of input buffers, and browser timers during computation.
+`test/editor_rendering_test.dart` verifies that overlay-only changes retain the
+document paint while content edits, stroke samples, and zoom still repaint it.
 
 ## Import and export
 

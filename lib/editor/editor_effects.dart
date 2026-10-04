@@ -25,7 +25,7 @@ extension EditorEffects on EditorController {
   );
 
   Future<void> applyFilter(EditorFilter filter, {double? amount}) async {
-    if (!_busy && hasActiveTransform) cancelTransform();
+    if (!_prepareOperation(settleTransaction: true)) return;
     final layer = activeLayer;
     final selectedPath = selectionPath;
     if (_busy ||
@@ -64,7 +64,7 @@ extension EditorEffects on EditorController {
           format: ui.ImageByteFormat.rawStraightRgba,
         );
         if (data == null) throw StateError('레이어 픽셀을 읽을 수 없습니다.');
-        final pixels = await compute(_filterPixels, <String, Object>{
+        final args = <String, Object>{
           'pixels': data.buffer.asUint8List(
             data.offsetInBytes,
             data.lengthInBytes,
@@ -80,7 +80,17 @@ extension EditorEffects on EditorController {
                 EditorFilter.threshold => .5,
                 _ => 1.0,
               },
-        });
+        };
+        final workerResult = await filterPixelsWeb(args);
+        final Uint8List pixels;
+        if (workerResult != null) {
+          pixels = workerResult;
+        } else {
+          pixels = await compute<Map<String, Object>, Uint8List>(
+            _filterPixels,
+            args,
+          );
+        }
         final completion = Completer<ui.Image>();
         ui.decodeImageFromPixels(
           pixels,
@@ -134,14 +144,17 @@ extension EditorEffects on EditorController {
     Size size,
     void Function(Canvas) transform,
   ) async {
-    if (_busy || _disposed || _stroke != null) return;
-    if (hasActiveTransform) cancelTransform();
-    if (size.width < 1 ||
-        size.height < 1 ||
-        size.width > 4096 ||
-        size.height > 4096) {
-      throw ArgumentError('크기는 1–4096 px 범위여야 합니다.');
-    }
+    if (!_canStartOperation) return;
+    EditorProjectSchema.validateDocumentSize(
+      size.width.toInt(),
+      size.height.toInt(),
+    );
+    EditorProjectSchema.validateDecodedBudget(
+      size.width.toInt(),
+      size.height.toInt(),
+      layerCount: _layers.length,
+    );
+    if (!_prepareOperation(settleTransaction: true)) return;
     _busy = true;
     _notify();
     final pending = <ui.Image>[];
@@ -177,7 +190,7 @@ extension EditorEffects on EditorController {
   }
 
   Future<void> cropToSelection() async {
-    if (!_busy && hasActiveTransform) cancelTransform();
+    if (!_prepareOperation(settleTransaction: true)) return;
     final rect = _selection?.intersect(Offset.zero & documentSize);
     if (rect == null || rect.isEmpty) return;
     final crop = Rect.fromLTRB(
@@ -214,7 +227,7 @@ extension EditorEffects on EditorController {
   }
 
   Future<void> flipActiveLayer({bool horizontal = true}) async {
-    if (!_busy && hasActiveTransform) cancelTransform();
+    if (!_prepareOperation(settleTransaction: true)) return;
     final layer = activeLayer;
     if (_busy ||
         layer == null ||
@@ -249,7 +262,7 @@ extension EditorEffects on EditorController {
   }
 
   Future<void> mergeDown() async {
-    if (!_busy && hasActiveTransform) cancelTransform();
+    if (!_prepareOperation(settleTransaction: true)) return;
     final index = _layers.indexWhere((layer) => layer.id == _activeLayerId);
     if (_busy || index < 1 || _disposed || _stroke != null) return;
     final top = _layers[index], bottom = _layers[index - 1];
@@ -272,7 +285,11 @@ extension EditorEffects on EditorController {
       _images.add(image);
       final merged = EditorLayer(
         id: bottom.id,
-        name: '${bottom.name} + ${top.name}',
+        name:
+            '${bottom.name} + ${top.name}'.length <=
+                EditorProjectSchema.maxLayerNameLength
+            ? '${bottom.name} + ${top.name}'
+            : '병합한 레이어',
         image: image,
       );
       _edit('아래 레이어와 병합', () {
@@ -286,8 +303,7 @@ extension EditorEffects on EditorController {
   }
 
   Future<void> flattenDocument() async {
-    if (_busy || _layers.isEmpty || _disposed || _stroke != null) return;
-    if (hasActiveTransform) cancelTransform();
+    if (!_prepareOperation(settleTransaction: true) || _layers.isEmpty) return;
     _busy = true;
     _notify();
     try {

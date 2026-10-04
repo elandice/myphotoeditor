@@ -44,9 +44,7 @@ extension EditorTransforms on EditorController {
 
   bool beginTransform() {
     final layer = activeLayer;
-    if (_busy ||
-        _disposed ||
-        _stroke != null ||
+    if (!_canStartOperation ||
         layer == null ||
         layer.locked ||
         !layer.visible) {
@@ -68,13 +66,13 @@ extension EditorTransforms on EditorController {
 
   void setActiveTransform({Offset? offset, double? rotation, double? scale}) {
     if (_busy || _disposed) return;
+    EditorProjectSchema.validateTransform(
+      offset: offset,
+      rotation: rotation,
+      scale: scale,
+    );
     if (_transform == null && !beginTransform()) return;
     final transform = _transform!;
-    if ((offset != null && (!offset.dx.isFinite || !offset.dy.isFinite)) ||
-        (rotation != null && !rotation.isFinite) ||
-        (scale != null && !scale.isFinite)) {
-      return;
-    }
     transform.offset = offset ?? transform.offset;
     transform.rotation = rotation ?? transform.rotation;
     transform.scale = scale?.clamp(.05, 10) ?? transform.scale;
@@ -178,6 +176,7 @@ extension EditorTransforms on EditorController {
     final transform = _transform;
     if (transform == null || _busy || _disposed) return;
     if (!_transactionChanged || transform.path == null) {
+      if (_transactionChanged) _documentChanged();
       _transform = null;
       commitTransaction();
       _contentChanged();
@@ -219,6 +218,7 @@ extension EditorTransforms on EditorController {
       image = null;
       mask = null;
       _layers[index] = result;
+      _documentChanged();
       _transform = null;
       _contentChanged();
       commitTransaction();

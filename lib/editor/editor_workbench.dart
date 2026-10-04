@@ -53,7 +53,7 @@ extension _WorkbenchUI on _EditorScreenState {
     ),
   );
   Future<void> _perform(Future<void> Function() action) async {
-    if (_loading || _fileBusy || _editor.isBusy) return;
+    if (_loading || _fileBusy || _editor.isBusy || _editor.isStroking) return;
     try {
       await action();
     } catch (error) {
@@ -84,29 +84,39 @@ extension _WorkbenchUI on _EditorScreenState {
     }
   }
 
-  Future<void> _saveProject() async {
-    if (_loading || _fileBusy || _editor.isBusy) return;
+  Future<bool> _saveProject() async {
+    if (_loading || _fileBusy || _editor.isBusy || _editor.isStroking) {
+      return false;
+    }
     _updateUI(() => _fileBusy = true);
     try {
       final bytes = await _editor.exportProject();
-      if (!mounted) return;
+      final token = _editor.documentToken;
+      if (!mounted) return false;
       final result = await EditorFiles.saveProject(bytes);
       if (result != ExportResult.cancelled) {
+        if (result == ExportResult.saved) _editor.markSaved(token: token);
         _showMessage(
           result == ExportResult.saved
               ? '레이어와 마스크를 프로젝트에 저장했습니다.'
               : '프로젝트 다운로드를 시작했습니다.',
         );
+        // Downloads cannot confirm the user retained the file. Keep recovery
+        // and close protection until they explicitly choose to discard.
+        return result == ExportResult.saved;
       }
+      return false;
     } catch (error) {
       _showMessage('프로젝트를 저장하지 못했습니다: $error');
+      return false;
     } finally {
       _updateUI(() => _fileBusy = false);
+      if (mounted) _onEditorChanged();
     }
   }
 
   Future<void> _openProject() async {
-    if (_loading || _fileBusy || _editor.isBusy) return;
+    if (!await _confirmDiscard() || !mounted) return;
     _updateUI(() => _fileBusy = true);
     try {
       final file = await EditorFiles.pickProject();
@@ -217,12 +227,17 @@ extension _WorkbenchUI on _EditorScreenState {
       ],
       if (tool == EditorTool.gradient) ...[
         const SizedBox(width: 20),
-        _colorDot(_editor.brushColor, true, _customColor),
+        _colorDot(_editor.brushColor, true, _customColor, tooltip: '색 편집'),
         const Padding(
           padding: EdgeInsets.symmetric(horizontal: 10),
           child: Icon(Icons.arrow_forward, size: 16, color: _muted),
         ),
-        _colorDot(_editor.secondaryColor, true, _pickSecondary),
+        _colorDot(
+          _editor.secondaryColor,
+          true,
+          _pickSecondary,
+          tooltip: '그라디언트 끝 색상',
+        ),
       ],
       if (tool == EditorTool.rectangle || tool == EditorTool.ellipse) ...[
         const SizedBox(width: 16),
@@ -241,37 +256,11 @@ extension _WorkbenchUI on _EditorScreenState {
     ];
   }
 
-  Future<void> _pickSecondary() async {
-    final color = await showDialog<Color>(
-      context: context,
-      builder: (dialog) => AlertDialog(
-        title: const Text('그라디언트 끝 색상'),
-        content: SizedBox(
-          width: 280,
-          child: Wrap(
-            spacing: 16,
-            runSpacing: 16,
-            children: [
-              for (final color in _swatches)
-                _colorDot(
-                  color,
-                  _editor.secondaryColor == color,
-                  () => Navigator.pop(dialog, color),
-                  size: 36,
-                ),
-            ],
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(dialog),
-            child: const Text('취소'),
-          ),
-        ],
-      ),
-    );
-    if (color != null && mounted) _editor.setSecondaryColor(color);
-  }
+  Future<void> _pickSecondary() => _pickColor(
+    initialColor: _editor.secondaryColor,
+    onSelected: _editor.setSecondaryColor,
+    title: '그라디언트 끝 색상',
+  );
 
   void _openActions() => showModalBottomSheet<void>(
     context: context,
@@ -474,7 +463,7 @@ extension _WorkbenchUI on _EditorScreenState {
           text: _editor.documentSize.height.round().toString(),
         );
     String? error;
-    final size = await showDialog<Size>(
+    final size = await _showOwnedDialog<Size>(
       context: context,
       builder: (dialog) => StatefulBuilder(
         builder: (context, update) => AlertDialog(
@@ -529,7 +518,6 @@ extension _WorkbenchUI on _EditorScreenState {
         ),
       ),
     );
-    await Future<void>.delayed(const Duration(milliseconds: 250));
     width.dispose();
     height.dispose();
     if (size != null && mounted) {
@@ -647,7 +635,7 @@ extension _WorkbenchUI on _EditorScreenState {
     double? amount;
     if (spec.$4.isNotEmpty) {
       var value = spec.$3;
-      amount = await showDialog<double>(
+      amount = await _showOwnedDialog<double>(
         context: context,
         builder: (dialog) => StatefulBuilder(
           builder: (context, update) => AlertDialog(

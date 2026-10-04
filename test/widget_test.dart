@@ -1,16 +1,25 @@
+import 'dart:ui' as ui;
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:myphotoeditor/editor/editor_controller.dart';
 import 'package:myphotoeditor/editor/editor_viewport.dart';
 import 'package:myphotoeditor/main.dart';
+import 'package:myphotoeditor/services/editor_recovery.dart';
 
-Future<EditorController> openEditor(WidgetTester tester, Size size) async {
+Future<EditorController> openEditor(
+  WidgetTester tester,
+  Size size, {
+  EditorRecoveryStore? recoveryStore,
+}) async {
   tester.view.devicePixelRatio = 1;
   tester.view.physicalSize = size;
   addTearDown(tester.view.resetDevicePixelRatio);
   addTearDown(tester.view.resetPhysicalSize);
-  await tester.pumpWidget(const MyApp());
+  await tester.pumpWidget(
+    MyApp(recoveryStore: recoveryStore ?? MemoryEditorRecoveryStore()),
+  );
   // Picture.toImage runs outside the widget-test fake clock.
   for (var attempt = 0; attempt < 60; attempt++) {
     await tester.runAsync(
@@ -41,7 +50,9 @@ void main() {
     ) async {
       final editor = await openEditor(tester, viewport.value);
       expect(find.text('luma'), findsOneWidget);
-      expect(editor.layers, isNotEmpty);
+      expect(editor.documentSize, const Size(1200, 900));
+      expect(editor.layers, hasLength(1));
+      expect(editor.isDirty, isFalse);
       expect(
         tester.getSize(find.byType(EditorViewport)).height,
         greaterThan(100),
@@ -50,6 +61,56 @@ void main() {
       expect(tester.takeException(), isNull);
     });
   }
+
+  testWidgets('startup is a clean transparent canvas ready for drawing', (
+    tester,
+  ) async {
+    final store = MemoryEditorRecoveryStore();
+    final editor = await openEditor(
+      tester,
+      const Size(1440, 900),
+      recoveryStore: store,
+    );
+    expect(find.text('이름 없는 작업'), findsWidgets);
+    expect(editor.documentSize, const Size(1200, 900));
+    expect(editor.layers, hasLength(1));
+    expect(editor.activeLayer!.name, '레이어 1');
+    expect(editor.activeLayer!.visible, isTrue);
+    expect(editor.activeLayer!.locked, isFalse);
+    expect(editor.isDirty, isFalse);
+    expect(editor.historyLength, 0);
+    expect(editor.canUndo, isFalse);
+    final initialImage = editor.activeLayer!.image;
+    final data = await tester.runAsync(
+      () => initialImage.toByteData(format: ui.ImageByteFormat.rawStraightRgba),
+    );
+    expect(data, isNotNull);
+    final pixels = data!.buffer.asUint8List(
+      data.offsetInBytes,
+      data.lengthInBytes,
+    );
+    expect(pixels.every((value) => value == 0), isTrue);
+    expect(await store.read(), isNull);
+
+    editor.beginStroke(const Offset(600, 450));
+    editor.appendStroke(const Offset(620, 450));
+    expect(editor.isStroking, isTrue);
+    await tester.runAsync(editor.endStroke);
+    expect(editor.isDirty, isTrue);
+    expect(editor.historyLength, 1);
+    expect(identical(editor.activeLayer!.image, initialImage), isFalse);
+    final painted = await tester.runAsync(
+      () => editor.activeLayer!.image.toByteData(
+        format: ui.ImageByteFormat.rawStraightRgba,
+      ),
+    );
+    expect(painted!.getUint8((450 * 1200 + 610) * 4 + 3), greaterThan(0));
+    editor.undo();
+    expect(identical(editor.activeLayer!.image, initialImage), isTrue);
+    expect(editor.isDirty, isFalse);
+    await tester.pumpWidget(const SizedBox.shrink());
+    expect(tester.takeException(), isNull);
+  });
 
   testWidgets('desktop layers and adjustment drag have working grouped undo', (
     tester,

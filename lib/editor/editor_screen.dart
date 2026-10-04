@@ -1,8 +1,13 @@
+import 'dart:async';
 import 'dart:math' as math;
+import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import '../services/editor_files.dart';
+import '../services/editor_recovery.dart';
 import 'editor_controller.dart';
+import 'editor_color_picker.dart';
+import 'editor_project_schema.dart';
 import 'editor_viewport.dart';
 
 part 'editor_workbench.dart';
@@ -11,19 +16,10 @@ const _accent = Color(0xFF7865E9);
 const _ink = Color(0xFF31333F);
 const _muted = Color(0xFF9295A3);
 const _line = Color(0xFFE9EAF0);
-const _swatches = [
-  Color(0xFF7865E9),
-  Color(0xFF303545),
-  Color(0xFFFFFFFF),
-  Color(0xFFEBA491),
-  Color(0xFFECC987),
-  Color(0xFF87AEA1),
-  Color(0xFF83A4C9),
-  Color(0xFFB097BC),
-];
 
 class EditorScreen extends StatefulWidget {
-  const EditorScreen({super.key});
+  const EditorScreen({super.key, this.recoveryStore});
+  final EditorRecoveryStore? recoveryStore;
   @override
   State<EditorScreen> createState() => _EditorScreenState();
 }
@@ -34,9 +30,19 @@ class _EditorScreenState extends State<EditorScreen> {
   bool _loading = true;
   bool _fileBusy = false;
   bool _grid = false;
-  String _documentName = '고요한 풍경';
+  String _documentName = '이름 없는 작업';
   int _inspectorTab = 0;
   bool _transformSliderActive = false;
+  late final EditorRecoveryStore _recovery;
+  late final EditorCloseGuard _closeGuard;
+  late final AppLifecycleListener _lifecycle;
+  Timer? _recoveryTimer;
+  int? _recoveryToken;
+  bool _recoveryWriting = false;
+  bool _recoveryAvailable = true;
+  bool _discardPromptOpen = false;
+  bool _dialogActive = false;
+  List<Color> _customColors = const [];
 
   bool get _hasTransformSelection =>
       _editor.isTransformingSelection ||
@@ -52,27 +58,240 @@ class _EditorScreenState extends State<EditorScreen> {
       ? '선택 영역을 드래그하여 이동 · 모서리로 크기 조절 · 위쪽 손잡이로 회전'
       : _toolHint(tool);
   void _updateUI(VoidCallback update) {
-    if (mounted) setState(update);
+    if (mounted) {
+      setState(update);
+      if (!_fileBusy) _onEditorChanged();
+    }
   }
 
   @override
   void initState() {
     super.initState();
+    _recovery = widget.recoveryStore ?? createEditorRecoveryStore();
+    _closeGuard = createEditorCloseGuard();
+    _editor.addListener(_onEditorChanged);
+    _lifecycle = AppLifecycleListener(
+      onExitRequested: () async => await _confirmDiscard(exiting: true)
+          ? ui.AppExitResponse.exit
+          : ui.AppExitResponse.cancel,
+      onPause: () => unawaited(_writeRecovery()),
+    );
     _initialize();
   }
 
   Future<void> _initialize() async {
+    Uint8List? recovery;
     try {
-      await _editor.initializeDemo();
+      await _editor.newDocument(1200, 900);
+      try {
+        recovery = await _recovery.read();
+      } catch (_) {
+        _recoveryAvailable = false;
+      }
     } catch (error) {
       _showMessage('캔버스를 준비하지 못했습니다: $error');
     } finally {
       if (mounted) setState(() => _loading = false);
     }
+    if (mounted && recovery != null) await _offerRecovery(recovery);
+    if (mounted && !_recoveryAvailable) {
+      _showMessage('자동 복구 저장소를 사용할 수 없습니다. 프로젝트를 직접 저장해 주세요.');
+    }
+  }
+
+  void _onEditorChanged() {
+    _closeGuard.update(_editor.isDirty);
+    _recoveryTimer?.cancel();
+    if (_loading ||
+        !_recoveryAvailable ||
+        _recoveryWriting ||
+        _discardPromptOpen ||
+        _dialogActive) {
+      return;
+    }
+    if (!_editor.isDirty) {
+      if (_recoveryToken != null) {
+        _recoveryToken = null;
+        unawaited(_clearRecovery());
+      }
+      return;
+    }
+    if (!_fileBusy &&
+        !_editor.isBusy &&
+        !_editor.isStroking &&
+        !_editor.hasActiveTransform &&
+        _recoveryToken != _editor.documentToken) {
+      _recoveryTimer = Timer(const Duration(seconds: 4), _writeRecovery);
+    }
+  }
+
+  Future<void> _clearRecovery() async {
+    try {
+      await _recovery.clear();
+    } catch (_) {
+      _recoveryAvailable = false;
+    }
+  }
+
+  Future<void> _writeRecovery() async {
+    if (mounted &&
+        _editor.isDirty &&
+        _recoveryAvailable &&
+        !_fileBusy &&
+        (_dialogActive || ModalRoute.of(context)?.isCurrent == false)) {
+      _recoveryTimer = Timer(const Duration(seconds: 1), _writeRecovery);
+      return;
+    }
+    if (!mounted ||
+        _loading ||
+        !_recoveryAvailable ||
+        _recoveryWriting ||
+        _fileBusy ||
+        _editor.isBusy ||
+        _editor.isStroking ||
+        _editor.hasActiveTransform ||
+        !_editor.isDirty ||
+        _recoveryToken == _editor.documentToken) {
+      return;
+    }
+    _recoveryWriting = true;
+    _updateUI(() => _fileBusy = true);
+    try {
+      final bytes = await _editor.exportProject();
+      final token = _editor.documentToken;
+      await _recovery.write(bytes);
+      _recoveryToken = token;
+    } catch (_) {
+      _recoveryAvailable = false;
+      _showMessage('자동 복구를 저장하지 못했습니다. 프로젝트를 직접 저장해 주세요.');
+    } finally {
+      _recoveryWriting = false;
+      _updateUI(() => _fileBusy = false);
+      if (mounted) _onEditorChanged();
+    }
+  }
+
+  Future<T?> _showOwnedDialog<T>({
+    required BuildContext context,
+    required WidgetBuilder builder,
+    bool barrierDismissible = true,
+  }) async {
+    final navigator = Navigator.of(context, rootNavigator: true);
+    final route = DialogRoute<T>(
+      context: context,
+      builder: builder,
+      barrierDismissible: barrierDismissible,
+    );
+    _dialogActive = true;
+    _recoveryTimer?.cancel();
+    try {
+      final result = await navigator.push(route);
+      // Pop results precede the reverse animation and widget disposal.
+      await route.completed;
+      return result;
+    } finally {
+      _dialogActive = false;
+      if (mounted) _onEditorChanged();
+    }
+  }
+
+  Future<void> _offerRecovery(Uint8List bytes) async {
+    final restore = await _showOwnedDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        title: const Text('이전 작업 복구'),
+        content: const Text('기기에 남아 있는 편집 작업을 복구할 수 있습니다.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('복구본 삭제'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('복구'),
+          ),
+        ],
+      ),
+    );
+    if (!mounted) return;
+    if (restore != true) {
+      await _clearRecovery();
+      return;
+    }
+    try {
+      await _editor.importProject(bytes);
+      _editor.markUnsaved();
+      _recoveryToken = _editor.documentToken;
+      _updateUI(() => _documentName = '복구한 작업');
+      _viewport.fit();
+    } catch (error) {
+      _showMessage('복구본을 열지 못했습니다: $error');
+    }
+  }
+
+  Future<bool> _confirmDiscard({bool exiting = false}) async {
+    if (_loading ||
+        _fileBusy ||
+        _editor.isBusy ||
+        _editor.isStroking ||
+        _dialogActive ||
+        _discardPromptOpen ||
+        !mounted) {
+      return false;
+    }
+    if (!_editor.isDirty) return true;
+    _discardPromptOpen = true;
+    var allowed = false;
+    _recoveryTimer?.cancel();
+    try {
+      final decision = await _showOwnedDialog<String>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('저장하지 않은 변경'),
+          content: const Text('현재 작업을 프로젝트로 저장한 뒤 계속할 수 있습니다.'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, 'cancel'),
+              child: const Text('취소'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(context, 'discard'),
+              child: const Text('저장하지 않고 계속'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, 'save'),
+              child: const Text('프로젝트 저장'),
+            ),
+          ],
+        ),
+      );
+      if (!mounted) return false;
+      if (decision == 'save') {
+        allowed = await _saveProject();
+        return allowed;
+      }
+      if (decision == 'discard') {
+        if (exiting) {
+          await _clearRecovery();
+          _recoveryToken = null;
+        }
+        allowed = true;
+        return allowed;
+      }
+      return false;
+    } finally {
+      _discardPromptOpen = false;
+      if (mounted && (!exiting || !allowed)) _onEditorChanged();
+    }
   }
 
   @override
   void dispose() {
+    _recoveryTimer?.cancel();
+    _editor.removeListener(_onEditorChanged);
+    _closeGuard.dispose();
+    _lifecycle.dispose();
     _viewport.dispose();
     _editor.dispose();
     super.dispose();
@@ -101,7 +320,7 @@ class _EditorScreenState extends State<EditorScreen> {
     } catch (error) {
       _showMessage('사진을 불러오지 못했습니다: $error');
     } finally {
-      if (mounted) setState(() => _fileBusy = false);
+      _updateUI(() => _fileBusy = false);
     }
   }
 
@@ -122,252 +341,283 @@ class _EditorScreenState extends State<EditorScreen> {
     } catch (error) {
       _showMessage('이미지를 내보내지 못했습니다: $error');
     } finally {
-      if (mounted) setState(() => _fileBusy = false);
+      _updateUI(() => _fileBusy = false);
     }
   }
 
   Future<void> _newDocument() async {
-    if (_fileBusy || _editor.isBusy) return;
-    final width = TextEditingController(text: '1200');
-    final height = TextEditingController(text: '900');
-    String? error;
-    final result = await showDialog<Size>(
-      context: context,
-      builder: (context) => StatefulBuilder(
-        builder: (context, update) => AlertDialog(
-          title: const Text('새 캔버스'),
-          content: SizedBox(
-            width: 340,
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text(
-                  '현재 작업은 교체됩니다. 필요한 이미지는 먼저 내보내세요.',
-                  style: TextStyle(fontSize: 13, height: 1.6),
-                ),
-                const SizedBox(height: 24),
-                Row(
-                  children: [
-                    Expanded(
-                      child: TextField(
-                        controller: width,
-                        keyboardType: TextInputType.number,
-                        inputFormatters: [
-                          FilteringTextInputFormatter.digitsOnly,
-                        ],
-                        decoration: const InputDecoration(labelText: '너비 (px)'),
-                      ),
-                    ),
-                    const Padding(
-                      padding: EdgeInsets.symmetric(horizontal: 12),
-                      child: Text('×'),
-                    ),
-                    Expanded(
-                      child: TextField(
-                        controller: height,
-                        keyboardType: TextInputType.number,
-                        inputFormatters: [
-                          FilteringTextInputFormatter.digitsOnly,
-                        ],
-                        decoration: const InputDecoration(labelText: '높이 (px)'),
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 12),
-                Text(
-                  error ?? '128–4096 px · 투명 배경',
-                  style: TextStyle(
-                    fontSize: 12,
-                    color: error == null ? _muted : Colors.red,
+    if (!await _confirmDiscard() || !mounted) return;
+    _updateUI(() => _fileBusy = true);
+    try {
+      final width = TextEditingController(text: '1200');
+      final height = TextEditingController(text: '900');
+      String? error;
+      final result = await _showOwnedDialog<Size>(
+        context: context,
+        builder: (context) => StatefulBuilder(
+          builder: (context, update) => AlertDialog(
+            title: const Text('새 캔버스'),
+            content: SizedBox(
+              width: 340,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    '새로운 투명 캔버스를 만듭니다.',
+                    style: TextStyle(fontSize: 13, height: 1.6),
                   ),
-                ),
-              ],
+                  const SizedBox(height: 24),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: TextField(
+                          controller: width,
+                          keyboardType: TextInputType.number,
+                          inputFormatters: [
+                            FilteringTextInputFormatter.digitsOnly,
+                          ],
+                          decoration: const InputDecoration(
+                            labelText: '너비 (px)',
+                          ),
+                        ),
+                      ),
+                      const Padding(
+                        padding: EdgeInsets.symmetric(horizontal: 12),
+                        child: Text('×'),
+                      ),
+                      Expanded(
+                        child: TextField(
+                          controller: height,
+                          keyboardType: TextInputType.number,
+                          inputFormatters: [
+                            FilteringTextInputFormatter.digitsOnly,
+                          ],
+                          decoration: const InputDecoration(
+                            labelText: '높이 (px)',
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 12),
+                  Text(
+                    error ?? '128–4096 px · 투명 배경',
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: error == null ? _muted : Colors.red,
+                    ),
+                  ),
+                ],
+              ),
             ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text('취소'),
+              ),
+              FilledButton(
+                onPressed: () {
+                  final w = int.tryParse(width.text) ?? 0;
+                  final h = int.tryParse(height.text) ?? 0;
+                  if (w < 128 || h < 128 || w > 4096 || h > 4096) {
+                    update(() => error = '너비와 높이를 128–4096 사이로 입력하세요.');
+                    return;
+                  }
+                  Navigator.pop(context, Size(w.toDouble(), h.toDouble()));
+                },
+                child: const Text('만들기'),
+              ),
+            ],
           ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(context),
-              child: const Text('취소'),
-            ),
-            FilledButton(
-              onPressed: () {
-                final w = int.tryParse(width.text) ?? 0;
-                final h = int.tryParse(height.text) ?? 0;
-                if (w < 128 || h < 128 || w > 4096 || h > 4096) {
-                  update(() => error = '너비와 높이를 128–4096 사이로 입력하세요.');
-                  return;
-                }
-                Navigator.pop(context, Size(w.toDouble(), h.toDouble()));
-              },
-              child: const Text('만들기'),
-            ),
-          ],
         ),
-      ),
-    );
-    await Future<void>.delayed(const Duration(milliseconds: 250));
-    width.dispose();
-    height.dispose();
-    if (result == null || !mounted) return;
-    await _editor.newDocument(result.width.toInt(), result.height.toInt());
-    if (mounted) {
-      setState(() => _documentName = '이름 없는 작업');
-      _viewport.fit();
+      );
+      width.dispose();
+      height.dispose();
+      if (result == null || !mounted) return;
+      await _editor.newDocument(result.width.toInt(), result.height.toInt());
+      if (mounted) {
+        setState(() => _documentName = '이름 없는 작업');
+        _viewport.fit();
+      }
+    } catch (error) {
+      _showMessage('새 캔버스를 만들지 못했습니다: $error');
+    } finally {
+      _updateUI(() => _fileBusy = false);
     }
   }
 
   Future<void> _editText({bool create = false}) async {
-    final layer = _editor.activeLayer;
-    final input = TextEditingController(text: create ? '' : layer?.text ?? '');
-    double fontSize = create ? 84 : layer?.fontSize ?? 84;
-    final result = await showDialog<(String, double)>(
-      context: context,
-      builder: (context) => StatefulBuilder(
-        builder: (context, update) => AlertDialog(
-          title: Text(create ? '텍스트 추가' : '텍스트 편집'),
-          content: SizedBox(
-            width: 360,
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                TextField(
-                  controller: input,
-                  autofocus: true,
-                  maxLines: 4,
-                  minLines: 2,
-                  decoration: const InputDecoration(hintText: '이야기를 더해 보세요…'),
-                ),
-                const SizedBox(height: 20),
-                Row(
-                  children: [
-                    const Text('글자 크기'),
-                    const Spacer(),
-                    Text('${fontSize.round()} px'),
-                  ],
-                ),
-                Slider(
-                  value: fontSize.clamp(12, 240),
-                  min: 12,
-                  max: 240,
-                  onChanged: (value) => update(() => fontSize = value),
-                ),
-              ],
-            ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(context),
-              child: const Text('취소'),
-            ),
-            FilledButton(
-              onPressed: () {
-                if (input.text.trim().isNotEmpty) {
-                  Navigator.pop(context, (input.text.trim(), fontSize));
-                }
-              },
-              child: const Text('적용'),
-            ),
-          ],
-        ),
-      ),
-    );
-    await Future<void>.delayed(const Duration(milliseconds: 250));
-    input.dispose();
-    if (result == null || !mounted) return;
-    if (create) {
-      await _editor.addText(
-        result.$1,
-        fontSize: result.$2,
-        color: _editor.brushColor,
+    if (_loading || _fileBusy || _editor.isBusy || _editor.isStroking) return;
+    _updateUI(() => _fileBusy = true);
+    try {
+      final layer = _editor.activeLayer;
+      final input = TextEditingController(
+        text: create ? '' : layer?.text ?? '',
       );
-    } else {
-      await _editor.updateText(result.$1, fontSize: result.$2);
+      double fontSize = create ? 84 : layer?.fontSize ?? 84;
+      String? inputError;
+      final result = await _showOwnedDialog<(String, double)>(
+        context: context,
+        builder: (context) => StatefulBuilder(
+          builder: (context, update) => AlertDialog(
+            title: Text(create ? '텍스트 추가' : '텍스트 편집'),
+            content: SizedBox(
+              width: 360,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  TextField(
+                    controller: input,
+                    autofocus: true,
+                    maxLength: EditorProjectSchema.maxTextLength,
+                    maxLines: 4,
+                    minLines: 2,
+                    decoration: InputDecoration(
+                      hintText: '이야기를 더해 보세요…',
+                      errorText: inputError,
+                    ),
+                  ),
+                  const SizedBox(height: 20),
+                  Row(
+                    children: [
+                      const Text('글자 크기'),
+                      const Spacer(),
+                      Text('${fontSize.round()} px'),
+                    ],
+                  ),
+                  Slider(
+                    value: fontSize.clamp(12, 240),
+                    min: 12,
+                    max: 240,
+                    onChanged: (value) => update(() => fontSize = value),
+                  ),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text('취소'),
+              ),
+              FilledButton(
+                onPressed: () {
+                  if (input.text.trim().isNotEmpty) {
+                    try {
+                      EditorProjectSchema.validateText(input.text.trim());
+                    } on ArgumentError catch (error) {
+                      update(() => inputError = error.message.toString());
+                      return;
+                    }
+                    Navigator.pop(context, (input.text.trim(), fontSize));
+                  }
+                },
+                child: const Text('적용'),
+              ),
+            ],
+          ),
+        ),
+      );
+      input.dispose();
+      if (result == null || !mounted) return;
+      if (create) {
+        await _editor.addText(
+          result.$1,
+          fontSize: result.$2,
+          color: _editor.brushColor,
+        );
+      } else {
+        await _editor.updateText(result.$1, fontSize: result.$2);
+      }
+    } catch (error) {
+      _showMessage('텍스트를 적용하지 못했습니다: $error');
+    } finally {
+      _updateUI(() => _fileBusy = false);
     }
   }
 
   Future<void> _renameLayer() async {
+    if (_loading || _fileBusy || _editor.isBusy || _editor.isStroking) return;
     final layer = _editor.activeLayer;
     if (layer == null) return;
-    final input = TextEditingController(text: layer.name);
-    final result = await showDialog<String>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('레이어 이름'),
-        content: TextField(
-          controller: input,
-          autofocus: true,
-          onSubmitted: (value) => Navigator.pop(context, value),
+    _updateUI(() => _fileBusy = true);
+    try {
+      final input = TextEditingController(text: layer.name);
+      String? inputError;
+      final result = await _showOwnedDialog<String>(
+        context: context,
+        builder: (context) => StatefulBuilder(
+          builder: (context, update) {
+            void submit() {
+              try {
+                EditorProjectSchema.validateLayerName(input.text.trim());
+              } on ArgumentError catch (error) {
+                update(() => inputError = error.message.toString());
+                return;
+              }
+              Navigator.pop(context, input.text);
+            }
+
+            return AlertDialog(
+              title: const Text('레이어 이름'),
+              content: TextField(
+                controller: input,
+                maxLength: EditorProjectSchema.maxLayerNameLength,
+                autofocus: true,
+                decoration: InputDecoration(errorText: inputError),
+                onSubmitted: (_) => submit(),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(context),
+                  child: const Text('취소'),
+                ),
+                FilledButton(onPressed: submit, child: const Text('저장')),
+              ],
+            );
+          },
         ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('취소'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(context, input.text),
-            child: const Text('저장'),
-          ),
-        ],
-      ),
-    );
-    await Future<void>.delayed(const Duration(milliseconds: 250));
-    input.dispose();
-    if (result != null && result.trim().isNotEmpty && mounted) {
-      _editor.renameLayer(layer.id, result.trim());
+      );
+      input.dispose();
+      if (result != null && result.trim().isNotEmpty && mounted) {
+        _editor.renameLayer(layer.id, result.trim());
+      }
+    } catch (error) {
+      _showMessage('레이어 이름을 변경하지 못했습니다: $error');
+    } finally {
+      _updateUI(() => _fileBusy = false);
     }
   }
 
-  Future<void> _customColor() async {
-    final input = TextEditingController(
-      text: _editor.brushColor
-          .toARGB32()
-          .toRadixString(16)
-          .substring(2)
-          .toUpperCase(),
-    );
-    String? error;
-    final color = await showDialog<Color>(
+  Future<void> _customColor() => _pickColor(
+    initialColor: _editor.brushColor,
+    onSelected: _editor.setBrushColor,
+  );
+
+  Future<void> _pickColor({
+    required Color initialColor,
+    required ValueChanged<Color> onSelected,
+    String title = '색 편집',
+  }) async {
+    if (_loading ||
+        _fileBusy ||
+        _dialogActive ||
+        _editor.isBusy ||
+        _editor.isStroking) {
+      return;
+    }
+    final selection = await _showOwnedDialog<EditorColorSelection>(
       context: context,
-      builder: (context) => StatefulBuilder(
-        builder: (context, update) => AlertDialog(
-          title: const Text('브러시 색상'),
-          content: TextField(
-            controller: input,
-            maxLength: 6,
-            decoration: InputDecoration(
-              prefixText: '#',
-              hintText: '7865E9',
-              errorText: error,
-            ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(context),
-              child: const Text('취소'),
-            ),
-            FilledButton(
-              onPressed: () {
-                final hex = input.text.trim().replaceFirst('#', '');
-                if (!RegExp(r'^[0-9a-fA-F]{6}$').hasMatch(hex)) {
-                  update(() => error = '6자리 HEX 색상을 입력하세요.');
-                  return;
-                }
-                Navigator.pop(
-                  context,
-                  Color(0xFF000000 | int.parse(hex, radix: 16)),
-                );
-              },
-              child: const Text('적용'),
-            ),
-          ],
-        ),
+      builder: (context) => EditorColorPickerDialog(
+        initialColor: initialColor,
+        customColors: _customColors,
+        title: title,
       ),
     );
-    await Future<void>.delayed(const Duration(milliseconds: 250));
-    input.dispose();
-    if (color != null && mounted) _editor.setBrushColor(color);
+    if (selection != null && mounted) {
+      setState(() => _customColors = selection.customColors);
+      onSelected(selection.color);
+    }
   }
 
   KeyEventResult _onKey(FocusNode node, KeyEvent event) {
@@ -376,6 +626,9 @@ class _EditorScreenState extends State<EditorScreen> {
         focused?.widget is EditableText ||
         focused?.findAncestorWidgetOfExactType<EditableText>() != null ||
         _loading ||
+        _fileBusy ||
+        _dialogActive ||
+        _editor.isStroking ||
         _editor.isBusy) {
       return KeyEventResult.ignored;
     }
@@ -460,83 +713,111 @@ class _EditorScreenState extends State<EditorScreen> {
         builder: (context, constraints) {
           final desktop = constraints.maxWidth >= 1000;
           final compact = constraints.maxWidth < 600;
-          return Scaffold(
-            body: SafeArea(
-              child: Column(
-                children: [
-                  _header(desktop, constraints.maxWidth < 760),
-                  _contextBar(compact),
-                  Expanded(
-                    child: Row(
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
-                      children: [
-                        if (!compact) _toolRail(),
-                        Expanded(
-                          child: Column(
-                            children: [
-                              if (!compact) _documentTab(),
-                              Expanded(
-                                child: Stack(
-                                  children: [
-                                    Positioned.fill(
-                                      child: _loading
-                                          ? const Center(
-                                              child: CircularProgressIndicator(
-                                                strokeWidth: 2,
-                                              ),
-                                            )
-                                          : EditorViewport(
-                                              controller: _editor,
-                                              viewportController: _viewport,
-                                              showGrid: _grid,
+          return PopScope<Object?>(
+            canPop: !_editor.isDirty && !_editor.isBusy && !_fileBusy,
+            onPopInvokedWithResult: (didPop, result) async {
+              if (!didPop &&
+                  await _confirmDiscard(exiting: true) &&
+                  context.mounted) {
+                if (Navigator.of(context).canPop()) {
+                  _editor.markSaved();
+                  Navigator.of(context).pop(result);
+                } else {
+                  await SystemNavigator.pop();
+                }
+              }
+            },
+            child: AbsorbPointer(
+              absorbing: _fileBusy,
+              child: Scaffold(
+                body: SafeArea(
+                  child: Column(
+                    children: [
+                      _header(desktop, constraints.maxWidth < 760),
+                      _contextBar(compact),
+                      Expanded(
+                        child: Row(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            if (!compact) _toolRail(),
+                            Expanded(
+                              child: Column(
+                                children: [
+                                  if (!compact) _documentTab(),
+                                  Expanded(
+                                    child: Stack(
+                                      children: [
+                                        Positioned.fill(
+                                          child: _loading
+                                              ? const Center(
+                                                  child:
+                                                      CircularProgressIndicator(
+                                                        strokeWidth: 2,
+                                                      ),
+                                                )
+                                              : EditorViewport(
+                                                  controller: _editor,
+                                                  viewportController: _viewport,
+                                                  showGrid: _grid,
+                                                  onDialogStateChanged:
+                                                      (active) {
+                                                        _dialogActive = active;
+                                                        if (!active) {
+                                                          _onEditorChanged();
+                                                        }
+                                                      },
+                                                ),
+                                        ),
+                                        Positioned(
+                                          top: 18,
+                                          left: 18,
+                                          child: IgnorePointer(
+                                            child: _badge(
+                                              '${_editor.documentSize.width.toInt()} × ${_editor.documentSize.height.toInt()} px',
                                             ),
-                                    ),
-                                    Positioned(
-                                      top: 18,
-                                      left: 18,
-                                      child: IgnorePointer(
-                                        child: _badge(
-                                          '${_editor.documentSize.width.toInt()} × ${_editor.documentSize.height.toInt()} px',
+                                          ),
                                         ),
-                                      ),
-                                    ),
-                                    Positioned(
-                                      right: 16,
-                                      bottom: 16,
-                                      child: _zoomControl(),
-                                    ),
-                                    if ((_fileBusy || _editor.isBusy) &&
-                                        !_loading)
-                                      const Positioned(
-                                        top: 0,
-                                        left: 0,
-                                        right: 0,
-                                        child: LinearProgressIndicator(
-                                          minHeight: 2,
+                                        Positioned(
+                                          right: 16,
+                                          bottom: 16,
+                                          child: _zoomControl(),
                                         ),
-                                      ),
-                                  ],
-                                ),
+                                        if ((_fileBusy || _editor.isBusy) &&
+                                            !_loading)
+                                          const Positioned(
+                                            top: 0,
+                                            left: 0,
+                                            right: 0,
+                                            child: LinearProgressIndicator(
+                                              minHeight: 2,
+                                            ),
+                                          ),
+                                      ],
+                                    ),
+                                  ),
+                                  if (!compact) _statusBar(),
+                                ],
                               ),
-                              if (!compact) _statusBar(),
-                            ],
-                          ),
-                        ),
-                        if (desktop)
-                          Container(
-                            width: 292,
-                            decoration: const BoxDecoration(
-                              color: Colors.white,
-                              border: Border(left: BorderSide(color: _line)),
                             ),
-                            child: _inspector(),
-                          ),
-                      ],
-                    ),
+                            if (desktop)
+                              Container(
+                                width: 292,
+                                decoration: const BoxDecoration(
+                                  color: Colors.white,
+                                  border: Border(
+                                    left: BorderSide(color: _line),
+                                  ),
+                                ),
+                                child: _inspector(),
+                              ),
+                          ],
+                        ),
+                      ),
+                      if (compact) _mobileTools(),
+                      if (!desktop) _mobilePanelBar(compact),
+                    ],
                   ),
-                  if (compact) _mobileTools(),
-                  if (!desktop) _mobilePanelBar(compact),
-                ],
+                ),
               ),
             ),
           );
@@ -599,7 +880,7 @@ class _EditorScreenState extends State<EditorScreen> {
           const SizedBox(height: 24, child: VerticalDivider(width: 1)),
           const SizedBox(width: 24),
           Text(
-            _documentName,
+            '$_documentName${_editor.isDirty ? ' •' : ''}',
             style: const TextStyle(fontWeight: FontWeight.w600),
           ),
           const SizedBox(width: 8),
@@ -683,6 +964,10 @@ class _EditorScreenState extends State<EditorScreen> {
             _displayToolName(_editor.tool),
             style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
           ),
+          if (compact) ...[
+            const SizedBox(width: 16),
+            _colorDot(_editor.brushColor, true, _customColor, tooltip: '색 편집'),
+          ],
           const SizedBox(width: 24),
           if (_editor.tool == EditorTool.brush ||
               _editor.tool == EditorTool.eraser ||
@@ -709,7 +994,13 @@ class _EditorScreenState extends State<EditorScreen> {
             ),
             _valuePill('${(_editor.brushOpacity * 100).round()}%'),
             const SizedBox(width: 24),
-            _colorDot(_editor.brushColor, true, _customColor),
+            if (!compact)
+              _colorDot(
+                _editor.brushColor,
+                true,
+                _customColor,
+                tooltip: '색 편집',
+              ),
             if (_editor.tool == EditorTool.cloneStamp) ...[
               const SizedBox(width: 12),
               TextButton.icon(
@@ -777,7 +1068,13 @@ class _EditorScreenState extends State<EditorScreen> {
                   padding: EdgeInsets.symmetric(horizontal: 20, vertical: 8),
                   child: Divider(),
                 ),
-                _colorDot(_editor.brushColor, true, _customColor, size: 32),
+                _colorDot(
+                  _editor.brushColor,
+                  true,
+                  _customColor,
+                  size: 32,
+                  tooltip: '색 편집',
+                ),
               ],
             ),
           ),
@@ -912,14 +1209,21 @@ class _EditorScreenState extends State<EditorScreen> {
               const Icon(Icons.photo_outlined, size: 15, color: _muted),
               const SizedBox(width: 9),
               Text(
-                _documentName,
+                '$_documentName${_editor.isDirty ? ' •' : ''}',
                 style: const TextStyle(
                   fontSize: 11,
                   fontWeight: FontWeight.w500,
                 ),
               ),
               const SizedBox(width: 20),
-              const Icon(Icons.circle, size: 5, color: _accent),
+              Tooltip(
+                message: _editor.isDirty ? '저장하지 않은 변경' : '저장된 상태',
+                child: Icon(
+                  Icons.circle,
+                  size: 5,
+                  color: _editor.isDirty ? _accent : _muted,
+                ),
+              ),
             ],
           ),
         ),
@@ -1092,32 +1396,11 @@ class _EditorScreenState extends State<EditorScreen> {
         decoration: const BoxDecoration(
           border: Border(top: BorderSide(color: _line)),
         ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text(
-              'COLOR PALETTE',
-              style: TextStyle(
-                fontSize: 9,
-                fontWeight: FontWeight.w700,
-                letterSpacing: 1.6,
-                color: _muted,
-              ),
-            ),
-            const SizedBox(height: 15),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                for (final color in _swatches)
-                  _colorDot(
-                    color,
-                    _editor.brushColor == color,
-                    () => _editor.setBrushColor(color),
-                    size: 24,
-                  ),
-              ],
-            ),
-          ],
+        child: EditorColorPalette(
+          color: _editor.brushColor,
+          customColors: _customColors,
+          onSelected: _editor.setBrushColor,
+          onEdit: _customColor,
         ),
       ),
     ],
@@ -1612,18 +1895,20 @@ class _EditorScreenState extends State<EditorScreen> {
     bool selected,
     VoidCallback onTap, {
     double size = 26,
+    String? tooltip,
   }) => Tooltip(
     message:
+        tooltip ??
         '#${color.toARGB32().toRadixString(16).substring(2).toUpperCase()}',
     child: InkWell(
       onTap: onTap,
-      borderRadius: BorderRadius.circular(size),
+      borderRadius: BorderRadius.circular(4),
       child: Container(
         width: size,
         height: size,
         padding: EdgeInsets.all(selected ? 3 : 1),
         decoration: BoxDecoration(
-          shape: BoxShape.circle,
+          borderRadius: BorderRadius.circular(4),
           border: Border.all(
             color: selected
                 ? color == Colors.white
@@ -1640,7 +1925,7 @@ class _EditorScreenState extends State<EditorScreen> {
     ),
   );
 
-  void _showHelp() => showDialog<void>(
+  void _showHelp() => _showOwnedDialog<void>(
     context: context,
     builder: (context) => AlertDialog(
       title: const Text('작은 도구로, 더 큰 가능성'),

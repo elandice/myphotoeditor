@@ -6,19 +6,20 @@ extension EditorProjects on EditorController {
     if (_stroke != null) await endStroke();
     if (hasActiveTransform) await commitTransform();
     if (_busy || _disposed) throw StateError('다른 작업을 처리 중입니다.');
-    final estimate = _layers.fold<int>(
-      0,
-      (bytes, layer) =>
-          bytes +
-          layer.image.width *
-              layer.image.height *
-              4 *
-              (layer.mask == null ? 1 : 2),
+    final width = documentSize.width.toInt();
+    final height = documentSize.height.toInt();
+    EditorProjectSchema.validateDecodedBudget(
+      width,
+      height,
+      layerCount: _layers.length,
+      maskCount: _layers.where((layer) => layer.mask != null).length,
     );
-    if (_layers.isEmpty || _layers.length > 64 || estimate > (256 << 20)) {
-      throw StateError(
-        '프로젝트는 최대 64개 레이어, 이미지·마스크 합계 256MiB까지 저장할 수 있습니다. 레이어를 병합하거나 크기를 줄여 주세요.',
-      );
+    final ids = <String>{};
+    for (final layer in _layers) {
+      EditorProjectSchema.validateLayer(layer, width: width, height: height);
+      if (!ids.add(layer.id)) {
+        throw StateError('레이어 식별자가 중복되었습니다.');
+      }
     }
     _busy = true;
     _notify();
@@ -26,9 +27,13 @@ extension EditorProjects on EditorController {
       Future<String> encode(ui.Image image) async {
         final data = await image.toByteData(format: ui.ImageByteFormat.png);
         if (data == null) throw StateError('레이어를 저장할 수 없습니다.');
-        return base64Encode(
+        final encoded = base64Encode(
           data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes),
         );
+        if (encoded.length > EditorProjectSchema.maxPngBase64Length) {
+          throw StateError('레이어 이미지가 프로젝트 파일 한도를 넘습니다.');
+        }
+        return encoded;
       }
 
       final records = <Map<String, Object?>>[];
@@ -61,14 +66,14 @@ extension EditorProjects on EditorController {
           jsonEncode({
             'format': 'luma-studio',
             'version': 1,
-            'width': documentSize.width.toInt(),
-            'height': documentSize.height.toInt(),
+            'width': width,
+            'height': height,
             'activeLayer': _activeLayerId,
             'layers': records,
           }),
         ),
       );
-      if (bytes.length > (128 << 20)) {
+      if (bytes.length > EditorProjectSchema.maxProjectBytes) {
         throw StateError('프로젝트 파일이 128MiB를 넘습니다. 레이어를 병합하거나 크기를 줄여 주세요.');
       }
       return bytes;
@@ -82,8 +87,7 @@ extension EditorProjects on EditorController {
     if (_busy || _disposed || _stroke != null) {
       throw StateError('다른 작업을 처리 중입니다.');
     }
-    if (hasActiveTransform) cancelTransform();
-    if (bytes.length > 128 << 20) {
+    if (bytes.length > EditorProjectSchema.maxProjectBytes) {
       throw const FormatException('프로젝트 파일은 128MiB 이하여야 합니다.');
     }
     final root = jsonDecode(utf8.decode(bytes));
@@ -97,21 +101,29 @@ extension EditorProjects on EditorController {
         records = root['layers'];
     if (width is! int ||
         height is! int ||
-        width < 1 ||
-        height < 1 ||
-        width > 4096 ||
-        height > 4096 ||
         records is! List ||
-        records.isEmpty ||
-        records.length > 64) {
+        (root['activeLayer'] != null && root['activeLayer'] is! String)) {
       throw const FormatException('문서 크기 또는 레이어 수가 올바르지 않습니다.');
     }
     final masks = records
         .where((record) => record is Map && record['mask'] != null)
         .length;
-    if (width * height * 4 * (records.length + masks) > 256 << 20) {
-      throw const FormatException('레이어 이미지의 메모리 합계는 256MiB 이하여야 합니다.');
+    void validate(VoidCallback action) {
+      try {
+        action();
+      } on ArgumentError catch (error) {
+        throw FormatException(error.message.toString());
+      }
     }
+
+    validate(
+      () => EditorProjectSchema.validateDecodedBudget(
+        width,
+        height,
+        layerCount: records.length,
+        maskCount: masks,
+      ),
+    );
     _busy = true;
     _notify();
     final pending = <ui.Image>[];
@@ -140,7 +152,12 @@ extension EditorProjects on EditorController {
         final value = record[key] ?? [0, 0];
         if (value is! List ||
             value.length != 2 ||
-            value.any((p) => p is! num || !p.isFinite || p.abs() > 1000000)) {
+            value.any(
+              (p) =>
+                  p is! num ||
+                  !p.isFinite ||
+                  p.abs() > EditorProjectSchema.maxCoordinate,
+            )) {
           throw FormatException('$key 좌표가 올바르지 않습니다.');
         }
         return Offset(
@@ -150,7 +167,8 @@ extension EditorProjects on EditorController {
       }
 
       Future<ui.Image> decode(Object? png) async {
-        if (png is! String || png.length > 96 << 20) {
+        if (png is! String ||
+            png.length > EditorProjectSchema.maxPngBase64Length) {
           throw const FormatException('레이어 이미지가 올바르지 않습니다.');
         }
         final data = base64Decode(png);
@@ -166,6 +184,9 @@ extension EditorProjects on EditorController {
           final image = (await codec.getNextFrame()).image;
           pending.add(image);
           return image;
+        } on Exception catch (error) {
+          if (error is FormatException) rethrow;
+          throw FormatException('레이어 이미지를 읽을 수 없습니다: $error');
         } finally {
           codec?.dispose();
           descriptor?.dispose();
@@ -175,33 +196,28 @@ extension EditorProjects on EditorController {
 
       final layers = <EditorLayer>[];
       final ids = <String>{};
+      var nextId = _nextId;
       String? active;
       for (final record in records) {
         if (record is! Map ||
             record['id'] is! String ||
             record['name'] is! String ||
             !ids.add(record['id'] as String) ||
-            (record['name'] as String).length > 500 ||
-            (record['text'] != null &&
-                (record['text'] is! String ||
-                    (record['text'] as String).length > 100000))) {
+            (record['text'] != null && record['text'] is! String)) {
           throw const FormatException('레이어 정보가 올바르지 않습니다.');
         }
+        validate(() {
+          EditorProjectSchema.validateLayerName(record['name'] as String);
+          if (record['text'] != null) {
+            EditorProjectSchema.validateText(record['text'] as String);
+          }
+        });
         final modeName = record['blendMode'] ?? 'srcOver';
         final modes = ui.BlendMode.values
             .where((mode) => mode.name == modeName)
             .toList();
         if (modes.isEmpty ||
-            !const {
-              ui.BlendMode.srcOver,
-              ui.BlendMode.multiply,
-              ui.BlendMode.screen,
-              ui.BlendMode.overlay,
-              ui.BlendMode.darken,
-              ui.BlendMode.lighten,
-              ui.BlendMode.difference,
-              ui.BlendMode.plus,
-            }.contains(modes.single)) {
+            !EditorProjectSchema.blendModes.contains(modes.single)) {
           throw const FormatException('지원하지 않는 블렌드 모드입니다.');
         }
         final color = record['color'] ?? 0xff7865e9;
@@ -211,11 +227,46 @@ extension EditorProjects on EditorController {
             (record['fontFamily'] != null && record['fontFamily'] is! String)) {
           throw const FormatException('텍스트 스타일이 올바르지 않습니다.');
         }
+        validate(
+          () => EditorProjectSchema.validateFontFamily(
+            record['fontFamily'] as String? ?? 'sans-serif',
+          ),
+        );
+        final maskEnabled = flag(record, 'maskEnabled', true);
+        final visible = flag(record, 'visible', true);
+        final locked = flag(record, 'locked', false);
+        final opacity = number(record, 'opacity', 1, 0, 1);
+        final offset = point(record, 'offset');
+        final rotation = number(
+          record,
+          'rotation',
+          0,
+          -EditorProjectSchema.maxRotation,
+          EditorProjectSchema.maxRotation,
+        );
+        final scale = number(
+          record,
+          'scale',
+          1,
+          EditorProjectSchema.minScale,
+          EditorProjectSchema.maxScale,
+        );
+        final brightness = number(record, 'brightness', 0, -1, 1);
+        final contrast = number(record, 'contrast', 1, 0, 2);
+        final saturation = number(record, 'saturation', 1, 0, 2);
+        final fontSize = number(
+          record,
+          'fontSize',
+          84,
+          EditorProjectSchema.minFontSize,
+          EditorProjectSchema.maxFontSize,
+        );
+        final textPosition = point(record, 'textPosition');
         final image = await decode(record['png']);
         final mask = record['mask'] == null
             ? null
             : await decode(record['mask']);
-        final id = _id();
+        final id = 'layer-${nextId++}';
         if (record['id'] == root['activeLayer']) active = id;
         layers.add(
           EditorLayer(
@@ -223,37 +274,50 @@ extension EditorProjects on EditorController {
             name: record['name'] as String,
             image: image,
             mask: mask,
-            maskEnabled: flag(record, 'maskEnabled', true),
-            visible: flag(record, 'visible', true),
-            locked: flag(record, 'locked', false),
-            opacity: number(record, 'opacity', 1, 0, 1),
+            maskEnabled: maskEnabled,
+            visible: visible,
+            locked: locked,
+            opacity: opacity,
             blendMode: modes.single,
-            offset: point(record, 'offset'),
-            rotation: number(record, 'rotation', 0, -10000, 10000),
-            scale: number(record, 'scale', 1, .05, 10),
-            brightness: number(record, 'brightness', 0, -1, 1),
-            contrast: number(record, 'contrast', 1, 0, 2),
-            saturation: number(record, 'saturation', 1, 0, 2),
+            offset: offset,
+            rotation: rotation,
+            scale: scale,
+            brightness: brightness,
+            contrast: contrast,
+            saturation: saturation,
             text: record['text'] as String?,
-            fontSize: number(record, 'fontSize', 84, 1, 1000),
+            fontSize: fontSize,
             fontFamily: record['fontFamily'] as String? ?? 'sans-serif',
             color: Color(color),
-            textPosition: point(record, 'textPosition'),
+            textPosition: textPosition,
+          ),
+        );
+        validate(
+          () => EditorProjectSchema.validateLayer(
+            layers.last,
+            width: width,
+            height: height,
           ),
         );
       }
       if (_disposed) return;
+      // Keep the existing preview and transaction intact until every layer has
+      // decoded successfully. A rejected project must not cancel user edits.
+      if (hasActiveTransform) cancelTransform();
+      commitTransaction();
+      _nextId = nextId;
       _images.addAll(pending);
       _edit('프로젝트 열기', () {
         _documentSize = Size(width.toDouble(), height.toDouble());
         _layers = layers;
-        _activeLayerId = active ?? layers.last.id;
+        _activeLayerId = active ?? (layers.isEmpty ? null : layers.last.id);
         _selection = null;
         _selectionPath = null;
         _selectionKind = null;
         _cloneSource = null;
         _cloneSourcePickMode = false;
       });
+      _resetDocumentIdentity();
       pending.clear();
     } finally {
       for (final image in pending) {

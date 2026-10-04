@@ -28,8 +28,7 @@ extension EditorOperations on EditorController {
   }
 
   void setSelectionPath(Path? path, {EditorSelectionKind? kind}) {
-    if (_busy) return;
-    if (hasActiveTransform) cancelTransform();
+    if (!_prepareOperation()) return;
     final bounds = Offset.zero & documentSize;
     final clipped = path == null
         ? null
@@ -54,8 +53,7 @@ extension EditorOperations on EditorController {
   );
   void selectAll() => setSelection(Offset.zero & documentSize);
   void invertSelection() {
-    if (_busy) return;
-    if (hasActiveTransform) cancelTransform();
+    if (!_prepareOperation()) return;
     setSelectionPath(
       _selectionPath == null
           ? (Path()..addRect(Offset.zero & documentSize))
@@ -97,7 +95,7 @@ extension EditorOperations on EditorController {
       path.transform(_inverseLayerMatrix(layer));
 
   Future<void> _drawOnActive(String label, void Function(Canvas) draw) async {
-    if (!_busy && hasActiveTransform) cancelTransform();
+    if (!_prepareOperation(settleTransaction: true)) return;
     final layer = activeLayer;
     if (_busy ||
         _disposed ||
@@ -200,7 +198,8 @@ extension EditorOperations on EditorController {
   }
 
   Future<Color?> sampleColor(Offset point) async {
-    if (_busy || _disposed || !(Offset.zero & documentSize).contains(point)) {
+    if (!_prepareOperation(settleTransaction: true) ||
+        !(Offset.zero & documentSize).contains(point)) {
       return null;
     }
     _busy = true;
@@ -227,14 +226,24 @@ extension EditorOperations on EditorController {
 
   Future<Path?> _regionAt(Offset point, double tolerance) async {
     if (!(Offset.zero & documentSize).contains(point)) return null;
-    final spans = await compute(_connectedColorRegion, <String, Object>{
+    final args = <String, Object>{
       'pixels': await _compositePixels(),
       'width': documentSize.width.toInt(),
       'height': documentSize.height.toInt(),
       'x': point.dx.floor(),
       'y': point.dy.floor(),
       'tolerance': tolerance.clamp(0, 1),
-    });
+    };
+    final workerResult = await connectedColorRegionWeb(args);
+    final List<int> spans;
+    if (workerResult != null) {
+      spans = workerResult;
+    } else {
+      spans = await compute<Map<String, Object>, List<int>>(
+        _connectedColorRegion,
+        args,
+      );
+    }
     final path = Path();
     // Merge identical scanlines into tall rectangles to keep ants and clipping
     // compact for broad flat regions instead of creating one contour per pixel.
@@ -269,8 +278,7 @@ extension EditorOperations on EditorController {
   }
 
   Future<void> magicWand(Offset point, {double tolerance = .12}) async {
-    if (_busy || _disposed) return;
-    if (hasActiveTransform) cancelTransform();
+    if (!_prepareOperation(settleTransaction: true)) return;
     _busy = true;
     _notify();
     try {
@@ -290,7 +298,7 @@ extension EditorOperations on EditorController {
   }
 
   Future<void> floodFill(Offset point, {double tolerance = .12}) async {
-    if (!_busy && hasActiveTransform) cancelTransform();
+    if (!_prepareOperation(settleTransaction: true)) return;
     if (_busy || activeLayer == null || activeLayer!.locked || _disposed) {
       return;
     }
@@ -316,7 +324,7 @@ extension EditorOperations on EditorController {
   }
 
   Future<void> copySelection() async {
-    if (!_busy && hasActiveTransform) cancelTransform();
+    if (!_prepareOperation(settleTransaction: true)) return;
     final layer = activeLayer;
     if (_busy || layer == null || _disposed || _stroke != null) return;
     _busy = true;
@@ -332,7 +340,7 @@ extension EditorOperations on EditorController {
       }
       _clipboard = image;
       _images.add(image);
-      _collectUnusedImages();
+      _pruneHistory();
       _notify();
     } finally {
       _busy = false;
@@ -347,9 +355,10 @@ extension EditorOperations on EditorController {
   }
 
   Future<void> pasteSelection() async {
-    if (!_busy && hasActiveTransform) cancelTransform();
+    if (!_prepareOperation(settleTransaction: true)) return;
     final clipboard = _clipboard;
     if (_busy || clipboard == null || _disposed) return;
+    _validateAdditionalLayers(layers: 1);
     _busy = true;
     _notify();
     try {
@@ -373,11 +382,12 @@ extension EditorOperations on EditorController {
   }
 
   Future<void> createMaskFromSelection() async {
-    if (!_busy && hasActiveTransform) cancelTransform();
+    if (!_prepareOperation(settleTransaction: true)) return;
     final layer = activeLayer;
     if (_busy || layer == null || layer.locked || _selectionPath == null) {
       return;
     }
+    _validateAdditionalLayers(masks: layer.mask == null ? 1 : 0);
     _busy = true;
     _notify();
     try {
@@ -425,7 +435,7 @@ extension EditorOperations on EditorController {
   }
 
   Future<void> invertActiveMask() async {
-    if (!_busy && hasActiveTransform) cancelTransform();
+    if (!_prepareOperation(settleTransaction: true)) return;
     final layer = activeLayer;
     if (_busy || layer == null || layer.mask == null || layer.locked) return;
     _busy = true;

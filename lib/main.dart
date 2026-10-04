@@ -1,10 +1,12 @@
 import 'package:flutter/material.dart';
 import 'editor/editor_screen.dart';
+import 'services/editor_recovery.dart';
 
 void main() => runApp(const MyApp());
 
 class MyApp extends StatelessWidget {
-  const MyApp({super.key});
+  const MyApp({super.key, this.recoveryStore});
+  final EditorRecoveryStore? recoveryStore;
   @override
   Widget build(BuildContext context) => MaterialApp(
     title: 'Luma Studio · 사진 편집기',
@@ -60,6 +62,6 @@ class MyApp extends StatelessWidget {
         overlayShape: RoundSliderOverlayShape(overlayRadius: 15),
       ),
     ),
-    home: const EditorScreen(),
+    home: EditorScreen(recoveryStore: recoveryStore),
   );
 }

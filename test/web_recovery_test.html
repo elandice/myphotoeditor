@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><title>Luma recovery tests</title>
+<script src="../web/editor_recovery.js"></script>
+<body><pre id="results">Running recovery tests...</pre>
+<script>
+(async () => {
+  const result = document.querySelector('#results');
+  let assertions = 0;
+  const assert = (value, message) => { assertions++; if (!value) throw new Error(message); };
+  try {
+    await lumaRecovery.clear();
+    assert(await lumaRecovery.read() === null, 'Empty store');
+    const bytes = new Uint8Array([1, 2, 3, 255]);
+    await lumaRecovery.write(bytes);
+    bytes[0] = 99;
+    const recovered = await lumaRecovery.read();
+    assert(recovered instanceof Uint8Array && recovered.join() === '1,2,3,255', 'Durable structured clone');
+    await lumaRecovery.write(new Uint8Array([8, 9]));
+    assert((await lumaRecovery.read()).join() === '8,9', 'Replace draft');
+    let rejected = false;
+    try { await lumaRecovery.write(new Uint8Array()); } catch (_) { rejected = true; }
+    assert(rejected, 'Reject empty draft');
+    assert((await lumaRecovery.read()).join() === '8,9', 'Failed write preserves draft');
+    lumaRecovery.setDirty(true);
+    const dirtyEvent = new Event('beforeunload', {cancelable: true});
+    dispatchEvent(dirtyEvent);
+    assert(dirtyEvent.defaultPrevented, 'Dirty close guard');
+    lumaRecovery.setDirty(false);
+    const cleanEvent = new Event('beforeunload', {cancelable: true});
+    dispatchEvent(cleanEvent);
+    assert(!cleanEvent.defaultPrevented, 'Clean close guard removed');
+    await lumaRecovery.clear();
+    assert(await lumaRecovery.read() === null, 'Clear recovery');
+    result.textContent = `PASS: ${assertions} recovery assertions.`;
+    document.body.dataset.result = 'pass';
+  } catch (error) {
+    result.textContent = `FAIL: ${error.stack || error}`;
+    document.body.dataset.result = 'fail';
+  }
+})();
+</script></body></html>
